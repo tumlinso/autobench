@@ -8,7 +8,8 @@ is planned separately.
 The [design](DESIGN.md) records product boundaries and the
 [implementation contract](IMPLEMENTATION.md) records the accepted first delivery.
 See [runtime guidance](docs/runtime.md) for configuration, recovery, and evidence
-retention. Host qualification is recorded separately from unit-test results.
+retention. [Host qualification](docs/qualification.md) records actual profiling,
+source refresh, deadline, quota, and preemption checks separately from unit tests.
 
 Each participating workspace uses `.autobench/` for registrations, build recipes,
 generated state and selected artifacts. Live worktree contents are authoritative.
