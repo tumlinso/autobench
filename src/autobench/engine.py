@@ -733,6 +733,7 @@ class Engine:
 
     async def _choose_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         scored = []
+        forecast_cache: dict[str, dict[str, Any]] = {}
         setup_counts: dict[tuple[str, str], int] = {}
         for candidate in candidates:
             command = candidate["command"]
@@ -759,9 +760,19 @@ class Engine:
                                "requirements": requirements, "lease_ttl_seconds": float(command.kill_seconds + 30),
                                "owner_context": {"project": str(self.project), "benchmark": candidate["benchmark"].name,
                                                  "packet": command.name}}
-                    forecast = await self.scheduler.call("resources.forecast", {"request": request,
-                                                                                  "horizon_seconds": 600,
-                                                                                  "max_candidates": 32})
+                    cache_key = json.dumps({"owner_id": owner, "requirements": requirements,
+                                            "lease_ttl_seconds": request["lease_ttl_seconds"],
+                                            "horizon_seconds": 600, "max_candidates": 32}, sort_keys=True)
+                    if cache_key in forecast_cache:
+                        forecast = forecast_cache[cache_key]
+                    else:
+                        try:
+                            forecast = await self.scheduler.call("resources.forecast", {"request": request,
+                                                                                          "horizon_seconds": 600,
+                                                                                          "max_candidates": 32})
+                        except Exception as exc:
+                            forecast = {"available": False, "reason": str(exc)}
+                        forecast_cache[cache_key] = forecast
                     options = [item for item in forecast.get("candidates", [])
                                if isinstance(item, dict) and item.get("feasible_now") is True]
                     if options:
@@ -773,7 +784,11 @@ class Engine:
                         selected_resource_ids = [item for item in ids
                                                  if isinstance(item, str) and
                                                  (kinds.get(item) == "gpu" or item.startswith("gpu:"))] if isinstance(ids, list) else []
-                        earliest = _timestamp(best.get("earliest_start"))
+                        # Feasible-now timestamps are sampled by separate calls;
+                        # using them as a score makes the first call win every
+                        # otherwise tied comparison. Ready placements all score
+                        # as current, leaving fit and setup grouping meaningful.
+                        earliest = 0.0
                         raw_window = best.get("window_seconds")
                         if isinstance(raw_window, (int, float)) and not isinstance(raw_window, bool):
                             window = max(0.0, float(raw_window))

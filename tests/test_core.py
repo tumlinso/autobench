@@ -1029,6 +1029,79 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
             finally:
                 engine.close()
 
+    def test_ready_candidates_normalize_forecast_time_and_prefer_shared_setup_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            now = datetime.now(timezone.utc).timestamp()
+            scheduler.forecast_by_packet = {
+                "cpu": {"candidates": [{"feasible_now": True, "resource_ids": ["host:worker-a:cpu"],
+                                        "earliest_start": now - 100, "window_seconds": 600}],
+                        "current_resources": [{"resource_id": "host:worker-a:cpu", "kind": "cpu"}]},
+                "gpu-one": {"candidates": [{"feasible_now": True, "resource_ids": ["gpu:worker-a:GPU-1", "gpu:worker-a:GPU-2"],
+                                             "earliest_start": now, "window_seconds": 600}],
+                            "current_resources": [{"resource_id": "gpu:worker-a:GPU-1", "kind": "gpu"},
+                                                  {"resource_id": "gpu:worker-a:GPU-2", "kind": "gpu"}]},
+                "gpu-two": {"candidates": [{"feasible_now": True, "resource_ids": ["gpu:worker-a:GPU-1", "gpu:worker-a:GPU-2"],
+                                             "earliest_start": now + 2, "window_seconds": 600}],
+                            "current_resources": [{"resource_id": "gpu:worker-a:GPU-1", "kind": "gpu"},
+                                                  {"resource_id": "gpu:worker-a:GPU-2", "kind": "gpu"}]},
+            }
+            engine = Engine(project, scheduler)
+            benchmark = type("B", (), {"name": "demo", "revision": 1, "protocol": {}})()
+            candidates = [
+                {"benchmark": benchmark, "command": Command(("python3", "cpu.py"), 2, 30,
+                                                               {"cpu_cores": 1}, name="cpu"),
+                 "identity": {"setup_key": "cpu-setup"}},
+                {"benchmark": benchmark, "command": Command(("python3", "gpu1.py"), 10, 30,
+                                                               {"gpu_memory_bytes": 1024, "gpu_count": 2}, name="gpu-one"),
+                 "identity": {"setup_key": "gpu-setup"}},
+                {"benchmark": benchmark, "command": Command(("python3", "gpu2.py"), 10, 30,
+                                                               {"gpu_memory_bytes": 1024, "gpu_count": 2}, name="gpu-two"),
+                 "identity": {"setup_key": "gpu-setup"}},
+            ]
+            try:
+                chosen = asyncio.run(engine._choose_candidate(candidates))
+                self.assertEqual(chosen["command"].name, "gpu-one")
+                forecast_calls = [args for op, args in scheduler.calls if op == "resources.forecast"]
+                self.assertEqual(len(forecast_calls), 2)
+                self.assertEqual({args["request"]["lease_ttl_seconds"] for args in forecast_calls}, {60.0})
+                self.assertEqual(len(chosen["identity"]["selected_resource_ids"]), 2)
+            finally:
+                engine.close()
+
+    def test_identical_forecast_cache_does_not_conflate_different_lease_ttls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            response = {"candidates": [{"feasible_now": True, "resource_ids": ["gpu:worker-a:GPU-1"],
+                                         "earliest_start": time.time(), "window_seconds": 600}],
+                        "current_resources": [{"resource_id": "gpu:worker-a:GPU-1", "kind": "gpu"}]}
+            scheduler.forecast_by_packet = {"same-a": response, "same-b": response, "longer": response}
+            engine = Engine(project, scheduler)
+            benchmark = type("B", (), {"name": "demo", "revision": 1, "protocol": {}})()
+            candidates = [
+                {"benchmark": benchmark, "command": Command(("python3", "a.py"), 1, 30,
+                                                               {"gpu_memory_bytes": 1024}, name="same-a"), "identity": {}},
+                {"benchmark": benchmark, "command": Command(("python3", "b.py"), 1, 30,
+                                                               {"gpu_memory_bytes": 1024}, name="same-b"), "identity": {}},
+                {"benchmark": benchmark, "command": Command(("python3", "c.py"), 1, 40,
+                                                               {"gpu_memory_bytes": 1024}, name="longer"), "identity": {}},
+            ]
+            try:
+                asyncio.run(engine._choose_candidate(candidates))
+                calls = [args for op, args in scheduler.calls if op == "resources.forecast"]
+                self.assertEqual(len(calls), 2)
+                self.assertEqual({args["request"]["lease_ttl_seconds"] for args in calls}, {60.0, 70.0})
+            finally:
+                engine.close()
+
     def test_future_only_forecast_never_selects_gpu_or_admits_packet(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp)
