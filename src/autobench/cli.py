@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .api import init_project, register_benchmark, register_definition
+from .api import (init_project, pause_project, reconcile_project, register_benchmark,
+                  register_definition, resume_project, workspace_compare, workspace_explain,
+                  workspace_results, workspace_status)
 from .catalog import Catalog
 from .engine import Engine
 from .errors import AutobenchError
@@ -176,6 +178,27 @@ async def _async_action(args: argparse.Namespace) -> int:
         await _serve_global()
         return 0
     project = _project(args.project)
+    if args.command == "status":
+        result = workspace_status(project)
+    elif args.command == "results":
+        result = workspace_results(project, args.name)
+    elif args.command == "compare":
+        result = workspace_compare(project, args.name)
+    elif args.command == "explain":
+        result = workspace_explain(project, args.name)
+    elif args.command == "pause":
+        result = pause_project(project)
+    elif args.command == "resume":
+        result = resume_project(project)
+        activated, activation_message = activate_existing_user_unit()
+        result.update({"service_activated": activated, "activation": activation_message})
+    elif args.command == "reconcile":
+        result = await reconcile_project(project)
+    else:
+        result = None
+    if result is not None:
+        print(json.dumps(result, indent=2, default=str))
+        return 0
     engine = _engine(project, require_scheduler=args.command in {"serve", "reconcile"})
     try:
         if args.command == "doctor":
@@ -183,39 +206,6 @@ async def _async_action(args: argparse.Namespace) -> int:
         elif args.command == "serve":
             await engine.run()
             return 0
-        elif args.command == "status":
-            result = engine.store.status()
-            result["registrations"] = [b.name for b in load_registry(project)]
-            result["retry_cooldowns"] = engine.retry_cooldowns()
-        elif args.command == "results":
-            names = [b.name for b in load_registry(project)] if args.name == "all" else [args.name]
-            result = {name: engine.store.attempts_for(name) for name in names}
-        elif args.command == "compare":
-            result = _compare(project, engine, args.name)
-        elif args.command == "explain":
-            result = engine.explain(args.name)
-        elif args.command == "pause":
-            engine.store.set("paused", True)
-            catalog = Catalog(create=False)
-            try:
-                catalog.set_active(project, False)
-            finally:
-                catalog.close()
-            result = {"paused": True}
-        elif args.command == "resume":
-            engine.store.set("paused", False)
-            config = json.loads((project / ".autobench/config.json").read_text(encoding="utf-8"))
-            config["active"] = True
-            temporary = project / ".autobench/config.json.tmp"
-            temporary.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-            temporary.replace(project / ".autobench/config.json")
-            catalog = Catalog(create=False)
-            try:
-                catalog.enroll(project, active=True)
-            finally:
-                catalog.close()
-            activated, activation_message = activate_existing_user_unit()
-            result = {"paused": False, "service_activated": activated, "activation": activation_message}
         else:
             result = await engine.reconcile_once()
         print(json.dumps(result, indent=2, default=str))
@@ -225,42 +215,8 @@ async def _async_action(args: argparse.Namespace) -> int:
 
 
 def _compare(project: Path, engine: Engine, name: str) -> dict[str, Any]:
-    out = project / ".autobench" / "evidence" / name
-    comparisons = []
-    for packet in sorted((p for p in out.iterdir() if p.is_dir()), key=lambda p: p.name) if out.exists() else []:
-        current_file = packet / "current.json"
-        baseline_file = packet / "baseline.json"
-        if not current_file.exists() or not baseline_file.exists():
-            continue
-        cur = json.loads(current_file.read_text()).get("metrics", {})
-        current = json.loads(current_file.read_text())
-        baseline = json.loads(baseline_file.read_text())
-        old = baseline.get("metrics", {})
-        differences = []
-        if current.get("protocol_fingerprint") != baseline.get("protocol_fingerprint"):
-            differences.append("measurement protocol differs")
-        if current.get("data_fingerprint") != baseline.get("data_fingerprint"):
-            differences.append("registered data identity differs")
-        current_device = current.get("device_identity")
-        baseline_device = baseline.get("device_identity")
-        if not current_device or not baseline_device:
-            differences.append("device identity is incomplete")
-        elif current_device != baseline_device:
-            differences.append("device identity differs")
-        deltas = {}
-        if not differences:
-            for key, value in cur.items():
-                prior = old.get(key)
-                if isinstance(value, (int, float)) and isinstance(prior, (int, float)):
-                    deltas[key] = {"baseline": prior, "current": value, "delta": value-prior, "relative": (value-prior)/prior if prior else None}
-        comparisons.append({"packet": packet.name, "comparable": not differences, "reasons": differences,
-                            "identity": {"current_protocol": current.get("protocol"), "baseline_protocol": baseline.get("protocol"),
-                                         "current_build": current.get("build_fingerprint"), "baseline_build": baseline.get("build_fingerprint"),
-                                         "current_source": current.get("source_fingerprint"), "baseline_source": baseline.get("source_fingerprint"),
-                                         "current_data": current.get("data_fingerprint"), "baseline_data": baseline.get("data_fingerprint"),
-                                         "current_device": current_device, "baseline_device": baseline_device},
-                            "metrics": deltas})
-    return {"benchmark": name, "comparisons": comparisons}
+    del engine
+    return workspace_compare(project, name)
 
 
 def _explain(engine: Engine, name: str) -> dict[str, Any]:

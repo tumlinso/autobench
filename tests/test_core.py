@@ -23,7 +23,9 @@ from autobench.store import Store
 from autobench.worker import execute
 from autobench.cli import _compare
 from autobench.cli import main as cli_main
-from autobench.api import init_project, register_benchmark, register_definition
+from autobench.api import (init_project, pause_project, reconcile_project, register_benchmark,
+                           register_definition, resume_project, workspace_compare,
+                           workspace_explain, workspace_results, workspace_status)
 from autobench.catalog import Catalog
 from autobench.models import Command
 from autobench.source_trace import SourceTrace
@@ -313,6 +315,83 @@ class AutobenchCoreTests(unittest.TestCase):
             registration = register_benchmark(project, "api", include=["src/**"], argv=["python3", "-c", "pass"], expected_seconds=1, kill_seconds=2)
             self.assertTrue(registration.exists())
             self.assertEqual(load_registry(project)[0].name, "api")
+
+    def test_public_workspace_api_queries_controls_and_reconciliation_match_cli(self):
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(Path(temp) / "state-home"),
+            "XDG_CONFIG_HOME": str(Path(temp) / "config-home"),
+        }):
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value=1\n")
+            init_project(project, agent_instructions="skip", activate=False)
+            definition = project / "definition.toml"
+            definition.write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1}
+''')
+            register_definition(project, definition)
+            scheduler = FakeScheduler()
+            self.assertEqual(asyncio.run(reconcile_project(project, scheduler=scheduler))["state"], "idle")
+            store = Store(project / ".autobench/state/autobench.sqlite3", create=False)
+            try:
+                seen = store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                store.set("seen:demo", seen)
+            finally:
+                store.close()
+            self.assertEqual(asyncio.run(reconcile_project(project, scheduler=scheduler))["state"], "submitted")
+
+            status = workspace_status(project)
+            self.assertIn("demo", status["registrations"])
+            results = workspace_results(project, "demo")
+            self.assertEqual(len(results["demo"]), 1)
+            explanation = workspace_explain(project, "demo")
+            self.assertEqual(explanation["benchmark"], "demo")
+            self.assertEqual(explanation["packets"][0]["name"], "run")
+
+            packet_dir = project / ".autobench/evidence/demo/0"
+            packet_dir.mkdir(parents=True)
+            identity = {"protocol_fingerprint": "protocol-v1", "data_fingerprint": "fixture-v1",
+                        "device_identity": [{"resource_id": "gpu:host:GPU-test"}]}
+            for filename, value in (("current.json", 2.0), ("baseline.json", 1.0)):
+                (packet_dir / filename).write_text(json.dumps({**identity, "metrics": {"median_ms": value}}))
+            comparison = workspace_compare(project, "demo")
+            self.assertTrue(comparison["comparisons"][0]["comparable"])
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(cli_main(["compare", "demo", "--project", str(project)]), 0)
+            self.assertEqual(json.loads(stdout.getvalue()), comparison)
+
+            paused = pause_project(project)
+            self.assertTrue(paused["paused"])
+            self.assertTrue(workspace_status(project)["paused"])
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(cli_main(["pause", "--project", str(project)]), 0)
+            self.assertTrue(json.loads(stdout.getvalue())["paused"])
+
+            resumed = resume_project(project)
+            self.assertFalse(resumed["paused"])
+            self.assertTrue(resumed["active"])
+            with patch("autobench.cli.activate_existing_user_unit", return_value=(True, "started")), \
+                 redirect_stdout(stdout := io.StringIO()):
+                self.assertEqual(cli_main(["resume", "--project", str(project)]), 0)
+            cli_resumed = json.loads(stdout.getvalue())
+            self.assertFalse(cli_resumed["paused"])
+            self.assertTrue(cli_resumed["active"])
 
     def test_cli_init_does_not_activate_when_scheduler_grants_are_missing_or_unreachable(self):
         import io
@@ -845,6 +924,7 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
             project = Path(temp)
             target = project / ".autobench/evidence/bench/0"
             target.mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
             current = {"metrics": {"median_ms": 2.0}, "protocol_fingerprint": "protocol-new",
                        "protocol": {"revision": 2}, "data_fingerprint": "fixture-v2",
                        "device_identity": [{"device_uuid": "GPU-L40"}], "build_fingerprint": "build-new"}

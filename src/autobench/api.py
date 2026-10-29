@@ -14,6 +14,29 @@ from .settings import host_limits
 from .store import Store
 
 
+class _LocalOnlyScheduler:
+    async def call(self, operation: str, arguments: Any = None) -> dict[str, Any]:
+        raise RuntimeError(f"Scheduler operation {operation} is unavailable in this local-only workspace query")
+
+
+def _workspace_root(project: str | Path) -> Path:
+    root = Path(project).expanduser().resolve()
+    if not (root / ".autobench" / "config.json").is_file():
+        raise RuntimeError("workspace is not initialized; run `autobench init` first")
+    if not (root / ".autobench" / "state" / "autobench.sqlite3").is_file():
+        raise RuntimeError("initialized Autobench state database is missing; no state was recreated")
+    return root
+
+
+def _workspace_engine(project: str | Path, scheduler: Any | None = None):
+    from .engine import Engine
+
+    root = _workspace_root(project)
+    if scheduler is None:
+        scheduler = _LocalOnlyScheduler()
+    return Engine(root, scheduler)
+
+
 def init_project(project: str | Path = ".", *, scheduler_url: str | None = None,
                  token_file: str | Path | None = None, retained_cap_bytes: int = 1024**3,
                  agent_instructions: str = "write", activate: bool = True) -> dict[str, Any]:
@@ -111,6 +134,138 @@ def register_definition(project: str | Path, definition: str | Path, *, replace_
     finally:
         temporary.unlink(missing_ok=True)
     return target
+
+
+def workspace_status(project: str | Path = ".") -> dict[str, Any]:
+    """Read project-local Autobench status without contacting Device Scheduler."""
+    root = _workspace_root(project)
+    engine = _workspace_engine(root)
+    try:
+        result = engine.store.status()
+        result["registrations"] = [benchmark.name for benchmark in load_registry(root)]
+        result["retry_cooldowns"] = engine.retry_cooldowns()
+        return result
+    finally:
+        engine.close()
+
+
+def workspace_results(project: str | Path = ".", name: str = "all") -> dict[str, list[dict[str, Any]]]:
+    """Return bounded attempt history for one or all registered benchmarks."""
+    root = _workspace_root(project)
+    names = [benchmark.name for benchmark in load_registry(root)] if name == "all" else [name]
+    store = Store(root / ".autobench/state/autobench.sqlite3", create=False)
+    try:
+        return {benchmark: store.attempts_for(benchmark) for benchmark in names}
+    finally:
+        store.close()
+
+
+def workspace_explain(project: str | Path, name: str, *, scheduler: Any | None = None) -> dict[str, Any]:
+    """Explain a registration's current freshness and retry state."""
+    engine = _workspace_engine(project, scheduler)
+    try:
+        return engine.explain(name)
+    finally:
+        engine.close()
+
+
+def workspace_compare(project: str | Path, name: str) -> dict[str, Any]:
+    """Compare current and baseline measurements only when identities agree."""
+    root = _workspace_root(project)
+    output = root / ".autobench" / "evidence" / name
+    comparisons = []
+    for packet in sorted((path for path in output.iterdir() if path.is_dir()), key=lambda path: path.name) if output.exists() else []:
+        current_file = packet / "current.json"
+        baseline_file = packet / "baseline.json"
+        if not current_file.exists() or not baseline_file.exists():
+            continue
+        current = json.loads(current_file.read_text(encoding="utf-8"))
+        baseline = json.loads(baseline_file.read_text(encoding="utf-8"))
+        current_metrics = current.get("metrics", {})
+        baseline_metrics = baseline.get("metrics", {})
+        differences = []
+        if current.get("protocol_fingerprint") != baseline.get("protocol_fingerprint"):
+            differences.append("measurement protocol differs")
+        if current.get("data_fingerprint") != baseline.get("data_fingerprint"):
+            differences.append("registered data identity differs")
+        current_device = current.get("device_identity")
+        baseline_device = baseline.get("device_identity")
+        if not current_device or not baseline_device:
+            differences.append("device identity is incomplete")
+        elif current_device != baseline_device:
+            differences.append("device identity differs")
+        deltas = {}
+        if not differences:
+            for key, value in current_metrics.items():
+                prior = baseline_metrics.get(key)
+                if isinstance(value, (int, float)) and isinstance(prior, (int, float)):
+                    deltas[key] = {"baseline": prior, "current": value, "delta": value - prior,
+                                   "relative": (value - prior) / prior if prior else None}
+        comparisons.append({"packet": packet.name, "comparable": not differences, "reasons": differences,
+                            "identity": {"current_protocol": current.get("protocol"), "baseline_protocol": baseline.get("protocol"),
+                                         "current_build": current.get("build_fingerprint"), "baseline_build": baseline.get("build_fingerprint"),
+                                         "current_source": current.get("source_fingerprint"), "baseline_source": baseline.get("source_fingerprint"),
+                                         "current_data": current.get("data_fingerprint"), "baseline_data": baseline.get("data_fingerprint"),
+                                         "current_device": current_device, "baseline_device": baseline_device},
+                            "metrics": deltas})
+    return {"benchmark": name, "comparisons": comparisons}
+
+
+def pause_project(project: str | Path = ".") -> dict[str, Any]:
+    """Pause workspace scheduling and deactivate catalog enrollment; no host service calls."""
+    root = _workspace_root(project)
+    store = Store(root / ".autobench/state/autobench.sqlite3", create=False)
+    try:
+        store.set("paused", True)
+    finally:
+        store.close()
+    _set_project_active(root, False)
+    return {"paused": True}
+
+
+def resume_project(project: str | Path = ".") -> dict[str, Any]:
+    """Resume workspace scheduling and activate catalog enrollment; no host service calls."""
+    root = _workspace_root(project)
+    store = Store(root / ".autobench/state/autobench.sqlite3", create=False)
+    try:
+        store.set("paused", False)
+    finally:
+        store.close()
+    _set_project_active(root, True)
+    return {"paused": False, "active": True}
+
+
+def _set_project_active(root: Path, active: bool) -> None:
+    config_path = root / ".autobench" / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["active"] = active
+    _atomic_json(config_path, config)
+    enrollment = root / ".autobench" / "enrolled.json"
+    if active:
+        _atomic_json(enrollment, {"active": True, "project": str(root), "activated_at": time.time()})
+    else:
+        enrollment.unlink(missing_ok=True)
+    catalog = Catalog(create=False)
+    try:
+        catalog.enroll(root, active=active)
+    finally:
+        catalog.close()
+
+
+async def reconcile_project(project: str | Path = ".", *, scheduler: Any | None = None) -> dict[str, Any]:
+    """Run one coordinator reconciliation pass, optionally using an injected Scheduler client."""
+    root = _workspace_root(project)
+    if scheduler is None:
+        config = json.loads((root / ".autobench" / "config.json").read_text(encoding="utf-8"))
+        if not config.get("scheduler_url") or not config.get("token_file"):
+            raise RuntimeError("Device Scheduler is not configured for this workspace")
+        from .scheduler import McpScheduler
+        scheduler = McpScheduler(config["scheduler_url"], config["token_file"])
+    engine = _workspace_engine(root, scheduler)
+    try:
+        return await engine.reconcile_once()
+    finally:
+        engine.close()
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:

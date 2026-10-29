@@ -64,6 +64,24 @@ also clear it. `autobench explain` reports the packet/build retry window, and
 `autobench status` lists active cooldowns. Cooldown state is derived from the
 bounded attempt history rather than a separate history map.
 
+The Python API exposes the same workspace queries and controls to hosting
+applications. Read operations are local; reconciliation accepts an injected
+Scheduler client for hosts that already own Scheduler transport:
+
+```python
+from autobench import (
+    reconcile_project, workspace_status, workspace_results,
+    workspace_explain, workspace_compare, pause_project, resume_project,
+)
+
+status = workspace_status("/path/to/workspace")
+evidence = workspace_results("/path/to/workspace", "sparse-support")
+one_pass = await reconcile_project("/path/to/workspace", scheduler=my_scheduler)
+```
+
+`pause_project` and `resume_project` update workspace and catalog state without
+starting or stopping host services. A hosting application can own that lifecycle.
+
 Import a full TOML definition through the CLI so it receives the same validation
 as the runtime registry:
 
