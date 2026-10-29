@@ -1,0 +1,126 @@
+[benchmark]
+name = "cellerator-sparse-support-indexing"
+revision = 1
+
+[source]
+# Deliberately narrow: do not include the full benchmark/evidence tree (which
+# contains large historical campaign artifacts).
+include = [
+  "include/Cellerator/compute/support/**",
+  "include/Cellerator/compute/indexing/**",
+  "include/Cellerator/compute/gating/**",
+  "src/support/*.cc",
+  "src/indexing/*.cc",
+  "src/gating/*.cc",
+  "src/gating/cuda_worksets.cu",
+  "src/indexing/cuda_postings.cu",
+  "bench/sparse_support/cuda_indexing_bench.cu",
+  "bench/sparse_support/run_cuda_indexing_bench.py",
+  "bench/sparse_support/scaled_fixtures.py",
+]
+
+[data]
+paths = [".autobench/data/cellerator-sparse-support-indexing/**"]
+
+[build]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/build.py",
+  "--source", "{snapshot}", "--build", "{build}", "--autobench-root", "{autobench}",
+]
+expected_seconds = 60
+kill_seconds = 300
+resources = { cpu_cores = 2, host_memory_bytes = 2147483648 }
+
+[[packet]]
+name = "prepare-fixture"
+kind = "cpu-prepare"
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/fixture.py",
+  "create", "--source", "{snapshot}", "--directory", "{project}/.autobench/data/cellerator-sparse-support-indexing",
+  "--size", "registered", "--metrics-output", "{output}/metrics.json",
+]
+expected_seconds = 3
+kill_seconds = 30
+resources = { cpu_cores = 1, host_memory_bytes = 1073741824 }
+
+[[packet]]
+name = "host-oracle"
+kind = "correctness"
+depends_on = ["prepare-fixture"]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/run_native.py",
+  "--source", "{snapshot}", "--binary", "{build}/cmake/cellerator_sparse_support_cuda_indexing_bench",
+  "--fixture-dir", "{snapshot}/.autobench/data/cellerator-sparse-support-indexing", "--output", "{output}/native-result.json",
+  "--mode", "oracle",
+]
+expected_seconds = 5
+kill_seconds = 30
+resources = { cpu_cores = 1, host_memory_bytes = 1073741824 }
+
+[[packet]]
+name = "cuda-oracle"
+kind = "correctness"
+depends_on = ["prepare-fixture"]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/run_native.py",
+  "--source", "{snapshot}", "--binary", "{build}/cmake/cellerator_sparse_support_cuda_indexing_bench",
+  "--fixture-dir", "{snapshot}/.autobench/data/cellerator-sparse-support-indexing", "--output", "{output}/native-result.json",
+  "--mode", "timing", "--warmup", "0", "--samples", "3", "--iterations", "1",
+]
+expected_seconds = 5
+kill_seconds = 30
+resources = { priority = "background", preemptible = true, mode = "exclusive", gpu_memory_bytes = 536870912, cpu_cores = 2, host_memory_bytes = 2147483648, tags = ["gpu.exclusive"] }
+
+[[packet]]
+name = "mechanism-timing"
+kind = "timing"
+depends_on = ["prepare-fixture"]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/run_native.py",
+  "--source", "{snapshot}", "--binary", "{build}/cmake/cellerator_sparse_support_cuda_indexing_bench",
+  "--fixture-dir", "{snapshot}/.autobench/data/cellerator-sparse-support-indexing", "--output", "{output}/native-result.json",
+  "--mode", "timing", "--warmup", "1", "--samples", "3", "--iterations", "1",
+]
+expected_seconds = 5
+kill_seconds = 30
+resources = { priority = "background", preemptible = true, mode = "exclusive", gpu_memory_bytes = 536870912, cpu_cores = 2, host_memory_bytes = 2147483648, tags = ["gpu.exclusive"] }
+
+[[packet]]
+name = "profile-nsys"
+kind = "timeline-profile"
+depends_on = ["prepare-fixture"]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/profile_nsys.py",
+  "--source", "{snapshot}", "--binary", "{build}/cmake/cellerator_sparse_support_cuda_indexing_bench",
+  "--fixture-dir", "{snapshot}/.autobench/data/cellerator-sparse-support-indexing", "--output-dir", "{output}",
+]
+expected_seconds = 30
+kill_seconds = 120
+resources = { priority = "background", preemptible = true, mode = "exclusive", gpu_memory_bytes = 536870912, cpu_cores = 2, host_memory_bytes = 2147483648, tags = ["gpu.exclusive"] }
+
+[[packet]]
+name = "profile-ncu"
+kind = "kernel-profile"
+depends_on = ["prepare-fixture"]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/profile_ncu.py",
+  "--source", "{snapshot}", "--binary", "{build}/cmake/cellerator_sparse_support_cuda_indexing_bench",
+  "--fixture-dir", "{snapshot}/.autobench/data/cellerator-sparse-support-indexing", "--output-dir", "{output}",
+]
+expected_seconds = 30
+kill_seconds = 120
+resources = { priority = "background", preemptible = true, mode = "exclusive", gpu_memory_bytes = 536870912, cpu_cores = 2, host_memory_bytes = 2147483648, tags = ["gpu.exclusive"] }
+
+[[packet]]
+name = "analyze-profiles"
+kind = "cpu-analysis"
+depends_on = ["profile-nsys", "profile-ncu"]
+argv = [
+  "python3", "{autobench}/examples/cellerator-sparse-support/scripts/analyze_profiles.py",
+  "--ncu-report", "{artifact.profile-ncu}/ncu/stage_worksets_kernel.ncu-rep",
+  "--nsys-report", "{artifact.profile-nsys}/nsys/sparse_index_pipeline.nsys-rep",
+  "--output-dir", "{output}",
+]
+expected_seconds = 10
+kill_seconds = 60
+resources = { cpu_cores = 1, host_memory_bytes = 2147483648 }

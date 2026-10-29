@@ -1,0 +1,14 @@
+[Unit]
+Description=Autobench coordinator for enrolled project workspaces
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/autobench serve
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

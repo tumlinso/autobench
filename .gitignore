@@ -8,13 +8,16 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
-dist/
-build/
+/dist/
+/build/
 .autobench/state/
 .autobench/builds/
 .autobench/evidence/
 .autobench/scratch/
 .autobench/captures/
+.autobench/snapshots/
 .autobench/data/
+.autobench/config.json
+.autobench/enrolled.json
 *.token
 
