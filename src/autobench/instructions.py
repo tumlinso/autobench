@@ -6,7 +6,7 @@ START = "<!-- agent-interface:autobench:start -->"
 END = "<!-- agent-interface:autobench:end -->"
 BLOCK = """<!-- agent-interface:autobench:start -->
 This repository has a canonical Autobench interface.
-Route benchmark registration, background measurement, profiling, and benchmark evidence requests through `autobench`.
+Route benchmark registration, background measurements and profiling, and registered benchmark evidence requests through `autobench`.
 Consider installing the [Autobench skill](https://github.com/tumlinso/autobench)
 to simplify development; if installed, read its `SKILL.md` before use.
 <!-- agent-interface:autobench:end -->"""

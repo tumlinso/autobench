@@ -3,8 +3,7 @@
 ## Project layout and registration
 
 `autobench init` creates `.autobench/registry/`, compact SQLite coordination state,
-build and evidence caches, and bounded scratch locations. Registry TOML and the
-`config.json` are authored project settings. State, builds, evidence, snapshots,
+build and evidence caches, and bounded scratch locations. Registry TOML contains authored benchmark settings. State, builds, evidence, snapshots,
 and scratch are ignored by Git. Initialization preserves or creates
 `.autobench/.gitignore`, which keeps machine-local/generated state out of Git
 while leaving registry TOML trackable. `config.json` and `enrolled.json` are
@@ -162,8 +161,10 @@ budgets are exceeded; it does not claim a transitive source closure.
 ## Evidence and retention
 
 SQLite stores compact attempts, current coverage, and up to 16 recent attempt
-summaries per benchmark. The artifact tree keeps current and previous baseline
+summaries per benchmark packet. The artifact tree keeps current and previous baseline
 outputs per packet; older reports are eligible for cleanup. Registration files,
 current evidence, active outputs, and unresolved attempt records are preserved.
 `autobench results`, `compare`, and `explain` read project-local Autobench
-evidence and do not append to a shared evidence store.
+evidence and do not append to a shared evidence store. Results are compact
+agent-facing summaries by default; `autobench results <name> --details` and
+`workspace_results(..., detailed=True)` opt into full retained attempt rows.

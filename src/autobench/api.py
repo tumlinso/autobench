@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -149,13 +150,118 @@ def workspace_status(project: str | Path = ".") -> dict[str, Any]:
         engine.close()
 
 
-def workspace_results(project: str | Path = ".", name: str = "all") -> dict[str, list[dict[str, Any]]]:
-    """Return bounded attempt history for one or all registered benchmarks."""
+def _compact_metrics(value: Any, limit: int = 64) -> dict[str, float | int]:
+    if not isinstance(value, dict):
+        return {}
+    compact: dict[str, float | int] = {}
+    for key in sorted(value):
+        metric = value[key]
+        if (isinstance(key, str) and len(key) <= 128 and isinstance(metric, (int, float))
+                and not isinstance(metric, bool) and math.isfinite(metric)):
+            compact[key] = metric
+            if len(compact) >= limit:
+                break
+    return compact
+
+
+def _tail(value: Any, max_bytes: int = 512) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    raw = value.encode("utf-8", errors="replace")[-max_bytes:]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _compact_attempt(root: Path, name: str, row: dict[str, Any], packet_names: dict[int, str], current_fp: str | None) -> dict[str, Any]:
+    packet_index = int(row.get("packet_index", -1))
+    fingerprint = str(row.get("fingerprint", ""))
+    evidence_dir = root / ".autobench" / "evidence" / name / str(packet_index)
+    artifact_dir = evidence_dir / fingerprint if fingerprint else None
+    artifact_ref = None
+    if artifact_dir is not None and artifact_dir.is_dir():
+        artifact_ref = artifact_dir.relative_to(root).as_posix()
+
+    pointer: dict[str, Any] = {}
+    evidence_role = None
+    for pointer_name in ("current.json", "baseline.json"):
+        try:
+            candidate = json.loads((evidence_dir / pointer_name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(candidate, dict) and candidate.get("fingerprint") == fingerprint:
+            pointer = candidate
+            evidence_role = "selected_current" if pointer_name == "current.json" else "baseline"
+            break
+
+    try:
+        result = json.loads(row.get("result_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        result = {}
+    result = result if isinstance(result, dict) else {}
+    worker = result.get("worker") if isinstance(result.get("worker"), dict) else {}
+    identity = result.get("identity") if isinstance(result.get("identity"), dict) else {}
+    device = identity.get("device_identity", pointer.get("device_identity", []))
+    short_device = []
+    if isinstance(device, list):
+        for descriptor in device[:8]:
+            if not isinstance(descriptor, dict):
+                continue
+            short_device.append({key: descriptor[key] for key in ("resource_id", "uuid", "host_id", "kind")
+                                if isinstance(descriptor.get(key), (str, int, float))})
+    metrics: Any = pointer.get("metrics", {})
+    metrics_path = artifact_dir / "metrics.json" if artifact_dir is not None else None
+    if metrics_path is not None:
+        try:
+            if metrics_path.stat().st_size <= 64 * 1024:
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    error = _tail(row.get("error"))
+    compact = {
+        "id": row.get("id"), "job_id": row.get("job_id"), "packet_index": packet_index,
+        "packet_name": "build" if packet_index < 0 else packet_names.get(packet_index, str(packet_index)),
+        "state": row.get("state"), "fingerprint": fingerprint,
+        "created": row.get("created"), "updated": row.get("updated"),
+        "duration_seconds": worker.get("duration_seconds"),
+        "metrics": _compact_metrics(metrics),
+        "identity": {
+            "source_fingerprint": identity.get("source_fingerprint", pointer.get("source_fingerprint")),
+            "build_fingerprint": identity.get("build_fingerprint", pointer.get("build_fingerprint")),
+            "data_fingerprint": identity.get("data_fingerprint", pointer.get("data_fingerprint")),
+            "protocol_fingerprint": identity.get("protocol_fingerprint", pointer.get("protocol_fingerprint")),
+            "device_identity": short_device,
+        },
+        "evidence_role": evidence_role or ("selected_current" if fingerprint and fingerprint == current_fp else None),
+    }
+    if artifact_ref is not None:
+        compact["artifact_ref"] = artifact_ref
+    if error is not None:
+        compact["error_tail"] = error
+    return compact
+
+
+def workspace_results(project: str | Path = ".", name: str = "all", *,
+                      detailed: bool = False) -> dict[str, list[dict[str, Any]]]:
+    """Return compact attempt evidence, or raw ledger rows when detailed=True."""
     root = _workspace_root(project)
-    names = [benchmark.name for benchmark in load_registry(root)] if name == "all" else [name]
+    registrations = load_registry(root)
+    names = [benchmark.name for benchmark in registrations] if name == "all" else [name]
+    packet_names = {benchmark.name: {index: packet.name for index, packet in enumerate(benchmark.packets)}
+                    for benchmark in registrations}
     store = Store(root / ".autobench/state/autobench.sqlite3", create=False)
     try:
-        return {benchmark: store.attempts_for(benchmark) for benchmark in names}
+        output = {}
+        for benchmark in names:
+            rows = store.attempts_for(benchmark)
+            if detailed:
+                output[benchmark] = rows
+                continue
+            compact = []
+            for row in rows:
+                compact.append(_compact_attempt(root, benchmark, row,
+                                                packet_names.get(benchmark, {}),
+                                                store.current(benchmark, int(row.get("packet_index", -1)))))
+            output[benchmark] = compact
+        return output
     finally:
         store.close()
 

@@ -393,6 +393,90 @@ resources={cpu_cores=1}
             self.assertFalse(cli_resumed["paused"])
             self.assertTrue(cli_resumed["active"])
 
+    def test_workspace_results_compacts_receipts_and_cli_details_are_explicit(self):
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(Path(temp) / "state-home"),
+            "XDG_CONFIG_HOME": str(Path(temp) / "config-home"),
+        }):
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value=1\n")
+            init_project(project, agent_instructions="skip", activate=False)
+            registration = project / "definition.toml"
+            registration.write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="profile"
+argv=["/usr/bin/true"]
+expected_seconds=1
+kill_seconds=5
+''')
+            register_definition(project, registration)
+            store = Store(project / ".autobench/state/autobench.sqlite3", create=False)
+            try:
+                fingerprint = "f" * 64
+                attempt = store.begin_attempt("demo", 1, 0, fingerprint)
+                huge_manifest = {f"src/file-{index}.cpp": "a" * 256 for index in range(200)}
+                raw_result = {
+                    "job": {"receipt": {"payload": "r" * 50_000}, "logs": {"stdout": "o" * 20_000}},
+                    "source_manifest": huge_manifest,
+                    "worker": {"duration_seconds": 12.5, "diagnostics": {"stderr_tail": "private raw"}},
+                    "identity": {"source_fingerprint": "source-fp", "build_fingerprint": "build-fp",
+                                 "data_fingerprint": "data-fp", "protocol_fingerprint": "protocol-fp",
+                                 "device_identity": [{"resource_id": "gpu:host:GPU-1", "uuid": "GPU-1",
+                                                      "host_id": "host", "kind": "gpu", "attributes": {"large": "x" * 2000}}]},
+                }
+                store.set_attempt(attempt, "succeeded", raw_result)
+                store.mark_current("demo", 0, fingerprint, attempt)
+            finally:
+                store.close()
+            artifact = project / ".autobench/evidence/demo/0" / fingerprint
+            artifact.mkdir(parents=True)
+            (artifact / "metrics.json").write_text(json.dumps({"median_ms": 2.5, "sample_count": 40,
+                                                                  "label": "discard nonnumeric", "truth": True}))
+            (artifact.parent / "current.json").write_text(json.dumps({
+                "fingerprint": fingerprint, "metrics": {"median_ms": 2.5, "sample_count": 40},
+                "source_fingerprint": "source-fp", "build_fingerprint": "build-fp",
+                "data_fingerprint": "data-fp", "protocol_fingerprint": "protocol-fp",
+                "device_identity": [{"resource_id": "gpu:host:GPU-1", "uuid": "GPU-1",
+                                     "host_id": "host", "kind": "gpu"}],
+            }))
+
+            compact = workspace_results(project, "demo")["demo"][0]
+            self.assertEqual({key: compact[key] for key in ("id", "job_id", "packet_index", "state")},
+                             {"id": attempt, "job_id": None, "packet_index": 0, "state": "succeeded"})
+            self.assertEqual(compact["packet_name"], "profile")
+            self.assertEqual(compact["metrics"], {"median_ms": 2.5, "sample_count": 40})
+            self.assertEqual(compact["duration_seconds"], 12.5)
+            self.assertEqual(compact["identity"]["source_fingerprint"], "source-fp")
+            self.assertEqual(compact["identity"]["build_fingerprint"], "build-fp")
+            self.assertEqual(compact["identity"]["device_identity"], [{"resource_id": "gpu:host:GPU-1",
+                                                                        "uuid": "GPU-1", "host_id": "host", "kind": "gpu"}])
+            self.assertEqual(compact["evidence_role"], "selected_current")
+            self.assertTrue(compact["artifact_ref"].endswith(f"demo/0/{fingerprint}"))
+            encoded_compact = json.dumps(compact)
+            self.assertNotIn("source_manifest", encoded_compact)
+            self.assertNotIn("receipt", encoded_compact)
+            self.assertNotIn("private raw", encoded_compact)
+            self.assertLess(len(encoded_compact), 3000)
+
+            detailed = workspace_results(project, "demo", detailed=True)["demo"][0]
+            self.assertIn("source_manifest", detailed["result_json"])
+            self.assertIn("receipt", detailed["result_json"])
+            for args, expected in ((["results", "demo", "--project", str(project)], {"demo": [compact]}),
+                                   (["results", "demo", "--details", "--project", str(project)], {"demo": [detailed]})):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    self.assertEqual(cli_main(args), 0)
+                self.assertEqual(json.loads(stdout.getvalue()), expected)
+
     def test_cli_init_does_not_activate_when_scheduler_grants_are_missing_or_unreachable(self):
         import io
         from contextlib import redirect_stdout
