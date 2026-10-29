@@ -933,7 +933,7 @@ class Engine:
         }
         if any(item.get("kind") == "gpu" for item in resource_requirements):
             spec["preconditions"] = [{"name": "gpu.quiescence", "schema_version": 1,
-                                      "parameters": {"timeout_seconds": 10, "interval_seconds": 1,
+                                      "parameters": {"timeout_seconds": 30, "interval_seconds": 1,
                                                      "consecutive_samples": 2, "max_utilization_percent": 0}}]
         try:
             response = await self.scheduler.call("jobs.submit", {"spec": spec})

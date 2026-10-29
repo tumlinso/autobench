@@ -665,6 +665,10 @@ resources={cpu_cores=1}
                 self.assertEqual(spec["resources"][0]["selectors"], {"resource_id": "gpu:worker-a:GPU-123"})
                 self.assertEqual(spec["resources"][0]["quantities"], {"memory_bytes": 1_000_000})
                 self.assertEqual(spec["preconditions"][0]["name"], "gpu.quiescence")
+                self.assertEqual(spec["preconditions"][0]["parameters"], {
+                    "timeout_seconds": 30, "interval_seconds": 1,
+                    "consecutive_samples": 2, "max_utilization_percent": 0,
+                })
                 from device_scheduler_core import JobSpec
                 JobSpec.from_dict(spec)
             finally:
