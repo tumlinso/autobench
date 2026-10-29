@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import fnmatch
 import hashlib
 import json
@@ -263,6 +264,83 @@ class Engine:
     def close(self) -> None:
         self.store.close()
 
+    @contextmanager
+    def _workspace_writer_lock(self):
+        """A fresh open-file-description lock shared by all coordinators/processes."""
+        lock_path = self.state / "coordinator.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        acquired = False
+        try:
+            try:
+                import fcntl
+            except ImportError as exc:
+                raise AutobenchError("workspace coordination requires POSIX advisory file locking") from exc
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    @staticmethod
+    def _remove_owned_attempt_path(path: Path) -> None:
+        if not path.exists() and not path.is_symlink():
+            return
+        parent = path.parent
+        try:
+            resolved_parent = parent.resolve(strict=True)
+        except OSError as exc:
+            raise OSError(f"cannot verify owned attempt path parent {parent}: {exc}") from exc
+        if resolved_parent != parent.absolute():
+            raise OSError(f"refusing to remove attempt path through a symlinked parent: {path}")
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+    def _recover_prepared_attempts(self) -> tuple[int, list[str]]:
+        """Clean intents known never to have reached Scheduler submission."""
+        rows = list(self.store.db.execute("SELECT id FROM attempts WHERE state='prepared' ORDER BY created"))
+        recovered = 0
+        failures: list[str] = []
+        for row in rows:
+            attempt_id = str(row["id"])
+            # Attempt IDs are generated UUIDs; reject malformed database values
+            # before deriving paths to remove from them.
+            try:
+                uuid.UUID(attempt_id)
+            except (ValueError, AttributeError):
+                self.store.set_attempt(attempt_id, "not_submitted", error="prepared row has a malformed attempt ID; no filesystem paths were removed")
+                self.store.delete_setting(f"attempt:{attempt_id}")
+                self.store.delete_setting(f"reservation:{attempt_id}")
+                recovered += 1
+                continue
+            staged = self.autobench / "scratch" / attempt_id
+            manifest = self.state / "packets" / f"{attempt_id}.json"
+            try:
+                self._remove_owned_attempt_path(staged)
+                self._remove_owned_attempt_path(manifest)
+            except OSError as exc:
+                failures.append(f"{attempt_id}: {exc}")
+                continue
+            details = self.store.get(f"attempt:{attempt_id}")
+            error = "recovered prepared attempt; Scheduler submission had not begun"
+            if not isinstance(details, dict):
+                error = "recovered orphan prepared attempt without metadata; Scheduler submission had not begun"
+            self.store.set_attempt(attempt_id, "not_submitted", error=error)
+            self.store.delete_setting(f"attempt:{attempt_id}")
+            self.store.delete_setting(f"reservation:{attempt_id}")
+            recovered += 1
+        return recovered, failures
+
     async def doctor(self) -> dict[str, Any]:
         benchmarks = load_registry(self.project)
         missing_tools = []
@@ -353,6 +431,18 @@ class Engine:
             return False
 
     async def reconcile_once(self) -> dict[str, Any]:
+        # Hold a nonblocking interprocess lock across all reads, Scheduler awaits,
+        # submit intent, and evidence import. A busy second coordinator does no work.
+        with self._workspace_writer_lock() as acquired:
+            if not acquired:
+                return {"state": "busy", "submitted": 0}
+            recovered, failures = self._recover_prepared_attempts()
+            if failures:
+                return {"state": "waiting_for_prepared_cleanup", "recovered": recovered,
+                        "failures": failures, "submitted": 0}
+            return await self._reconcile_once_locked()
+
+    async def _reconcile_once_locked(self) -> dict[str, Any]:
         if self.store.get("paused", False):
             return {"state": "paused", "submitted": 0}
         reconciled = await self._reconcile_jobs()
@@ -363,6 +453,7 @@ class Engine:
             return {"state": "waiting_for_scheduler_cleanup", "reconciled": reconciled, "submitted": 0}
         benchmarks = load_registry(self.project)
         candidates: list[dict[str, Any]] = []
+        storage_blocked: list[str] = []
         for benchmark in benchmarks:
             if not benchmark.enabled:
                 continue
@@ -408,10 +499,16 @@ class Engine:
                 fingerprint = expected_fingerprints[packet.name]
                 if self.store.current(benchmark.name, index) == fingerprint:
                     continue
+                cap_now = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
+                packet_error = self.store.get(f"packet-storage-error:{benchmark.name}:{index}")
+                if (isinstance(packet_error, dict) and packet_error.get("fingerprint") == fingerprint and
+                    packet_error.get("cap") == cap_now and packet_error.get("scratch_limit") == self.limits["scratch_limit_bytes"]):
+                    storage_blocked.append(packet.name)
+                    continue
                 if benchmark.build and not self._build_is_current(build_dir, build_fp or ""):
                     prior_error = self.store.get(f"build-storage-error:{benchmark.name}")
-                    cap_now = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
-                    if isinstance(prior_error, dict) and prior_error.get("fingerprint") == build_fp and prior_error.get("cap") == cap_now:
+                    if (isinstance(prior_error, dict) and prior_error.get("fingerprint") == build_fp and
+                        prior_error.get("cap") == cap_now and prior_error.get("scratch_limit") == self.limits["scratch_limit_bytes"]):
                         return {"state": "storage_over_cap", "benchmark": benchmark.name, "reason": "the verified build does not fit the retained-data cap"}
                     self.store.delete_setting(f"build-storage-error:{benchmark.name}")
                     # This registration now needs the new build. If quota pressure
@@ -432,16 +529,21 @@ class Engine:
         if candidates:
             candidate = await self._choose_candidate(candidates)
             requested, _ = _scheduler_resources(candidate["command"].resources)
-            if any(item.get("kind") == "gpu" for item in requested) and not candidate["identity"].get("selected_resource_ids"):
-                return {"state": "waiting_for_forecast_resources", "reconciled": reconciled,
+            if requested and not candidate["identity"].get("forecast_ready"):
+                forecast = candidate["identity"].get("availability_forecast")
+                reason = candidate["identity"].get("forecast_wait_reason")
+                return {"state": "waiting_for_forecast_window" if reason == "window_too_short" else "waiting_for_forecast_resources", "reconciled": reconciled,
                         "benchmark": candidate["benchmark"].name, "packet": candidate["command"].name,
-                        "forecast": candidate["identity"].get("availability_forecast"), "submitted": 0}
+                        "reason": reason, "forecast": forecast, "submitted": 0}
             await self._submit(candidate["benchmark"], candidate["snapshot"], candidate["build"], candidate["command"],
                                candidate["index"], candidate["fingerprint"], kind=candidate["command"].kind,
                                artifacts=candidate["artifacts"], identity=candidate["identity"])
             return {"state": "submitted", "reconciled": reconciled, "benchmark": candidate["benchmark"].name,
                     "kind": candidate["command"].kind, "submitted": 1,
                     "forecast": candidate["identity"].get("availability_forecast")}
+        if storage_blocked:
+            return {"state": "storage_over_cap", "reconciled": reconciled, "submitted": 0,
+                    "packets": storage_blocked}
         return {"state": "idle", "reconciled": reconciled, "submitted": 0}
 
     async def _owner_id(self) -> str:
@@ -471,11 +573,13 @@ class Engine:
             command = candidate["command"]
             requirements, _tags = _scheduler_resources(command.resources)
             forecast = None
-            fit = 1
+            fit = 2 if requirements else 0
             earliest = float("inf")
             window = float("inf")
             selected_resource_ids: list[str] = []
             has_gpu = any(item.get("kind") == "gpu" for item in requirements)
+            forecast_ready = not requirements
+            wait_reason = None
             if requirements:
                 try:
                     owner = await self._owner_id()
@@ -484,28 +588,44 @@ class Engine:
                                "owner_context": {"project": str(self.project), "benchmark": candidate["benchmark"].name,
                                                  "packet": command.name}}
                     forecast = await self.scheduler.call("resources.forecast", {"request": request,
-                                                                                  "horizon_seconds": 1800,
+                                                                                  "horizon_seconds": 600,
                                                                                   "max_candidates": 32})
-                    options = [item for item in forecast.get("candidates", []) if isinstance(item, dict) and item.get("feasible") is True]
+                    options = [item for item in forecast.get("candidates", [])
+                               if isinstance(item, dict) and item.get("feasible_now") is True]
                     if options:
                         best = min(options, key=lambda item: _timestamp(item.get("earliest_start")))
                         ids = best.get("resource_ids", [])
-                        selected_resource_ids = [item for item in ids if isinstance(item, str) and item.startswith("gpu:")] if isinstance(ids, list) else []
+                        current_resources = forecast.get("current_resources", [])
+                        kinds = {item.get("resource_id"): item.get("kind") for item in current_resources
+                                 if isinstance(item, dict) and isinstance(item.get("resource_id"), str)}
+                        selected_resource_ids = [item for item in ids
+                                                 if isinstance(item, str) and
+                                                 (kinds.get(item) == "gpu" or item.startswith("gpu:"))] if isinstance(ids, list) else []
                         earliest = _timestamp(best.get("earliest_start"))
-                        released = _timestamp(best.get("expected_release"))
-                        uncertainty = float(best.get("uncertainty_seconds") or 0)
-                        window = max(0, released - earliest - uncertainty) if released != float("inf") and earliest != float("inf") else float("inf")
-                        fit = 0 if window >= estimate + 5 else 1
-                    elif has_gpu:
-                        fit = 2
+                        raw_window = best.get("window_seconds")
+                        if isinstance(raw_window, (int, float)) and not isinstance(raw_window, bool):
+                            window = max(0.0, float(raw_window))
+                        else:
+                            # Compatibility with an older Scheduler response. Never
+                            # treat expected_release (a start estimate) as a window end.
+                            window = 0.0
+                        expected_gpu_count = sum(1 for item in requirements if item.get("kind") == "gpu")
+                        enough_gpu_ids = not has_gpu or len(selected_resource_ids) == expected_gpu_count
+                        forecast_ready = enough_gpu_ids and window >= estimate + 5
+                        if forecast_ready:
+                            fit = 0
+                        else:
+                            wait_reason = "window_too_short" if enough_gpu_ids else "atomic_gpu_placement_missing"
+                            fit = 2
+                    else:
+                        wait_reason = "no_feasible_now_atomic_placement"
                 except Exception as exc:
                     forecast = {"available": False, "reason": str(exc)}
-                    if has_gpu:
-                        fit = 2
-            if has_gpu and not selected_resource_ids:
-                fit = 2
+                    wait_reason = "forecast_unavailable"
             candidate["identity"]["selected_resource_ids"] = selected_resource_ids
             candidate["identity"]["availability_forecast"] = forecast
+            candidate["identity"]["forecast_ready"] = forecast_ready
+            candidate["identity"]["forecast_wait_reason"] = wait_reason
             setup_group = (candidate["identity"].get("setup_key", ""), json.dumps(requirements, sort_keys=True))
             # Prefer an anticipated window that fits, then the earliest start;
             # compatible ready packets with shared verified setup/data stay
@@ -575,12 +695,18 @@ class Engine:
         try:
             argv, environment = _substitute(command, snapshot, build, staged, self.project, artifacts or {}, _autobench_root(self.config))
             selected = (identity or {}).get("selected_resource_ids")
+            requested_requirements, _ = _scheduler_resources(command.resources)
+            if any(item.get("kind") == "gpu" for item in requested_requirements) and (
+                (identity or {}).get("forecast_ready") is not True or not selected
+            ):
+                raise AutobenchError("GPU work requires a feasible-now forecast-selected stable Scheduler resource ID")
             resource_requirements, resource_tags = _scheduler_resources(command.resources, selected if isinstance(selected, list) else None)
-            if any(item.get("kind") == "gpu" for item in resource_requirements) and not selected:
-                raise AutobenchError("GPU work requires a forecast-selected stable Scheduler resource ID")
             packet_manifest.parent.mkdir(parents=True, exist_ok=True)
             packet_manifest.write_text(json.dumps({"argv": argv, "working_directory": str(snapshot), "allowed_root": str(self.project),
                                                   "result_directory": str(staged), "kill_seconds": command.kill_seconds,
+                                                  "managed_root": str(self.autobench),
+                                                  "scratch_limit_bytes": self.limits["scratch_limit_bytes"],
+                                                  "retained_cap_bytes": cap,
                                                   "environment": environment, "output_limit_bytes": self.limits["output_limit_bytes"]}), encoding="utf-8")
         except Exception:
             shutil.rmtree(staged, ignore_errors=True)
@@ -728,6 +854,19 @@ class Engine:
                     state = "storage_over_cap"
             else:
                 state = result.get("status", "failed")
+                if state == "storage_over_cap":
+                    failure_record = {
+                        "fingerprint": details.get("fingerprint"),
+                        "cap": min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"]),
+                        "scratch_limit": self.limits["scratch_limit_bytes"],
+                    }
+                    if details.get("kind") == "build":
+                        # The worker stopped this admitted build command itself;
+                        # verified Scheduler cleanup now allows deleting its partial cache.
+                        shutil.rmtree(Path(details["build"]), ignore_errors=True)
+                        self.store.set(f"build-storage-error:{details['benchmark']}", failure_record)
+                    else:
+                        self.store.set(f"packet-storage-error:{details['benchmark']}:{int(details['packet_index'])}", failure_record)
             device_identity = _device_identity(job)
             protocol_fingerprint = hashlib.sha256(json.dumps(details.get("protocol", {}), sort_keys=True).encode()).hexdigest()
             self.store.set_attempt(attempt["id"], state, {"job": dict(job), "worker": result,
@@ -739,11 +878,12 @@ class Engine:
             self._evict_safe()
             if details.get("kind") == "build":
                 cap = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
-                if _disk_usage(self.autobench) > cap:
+                if _disk_usage(self.autobench) > cap or result.get("status") == "storage_over_cap":
                     build = Path(details["build"])
                     shutil.rmtree(build, ignore_errors=True)
-                    self.store.set(f"build-storage-error:{details['benchmark']}", {"fingerprint": details["fingerprint"], "cap": cap})
-                    self.store.set_attempt(attempt["id"], "storage_over_cap", result={"scheduler_job": dict(job), "cleanup_verified": True}, error="build cache could not fit after safe eviction")
+                    self.store.set(f"build-storage-error:{details['benchmark']}", {"fingerprint": details["fingerprint"], "cap": cap,
+                                                                                     "scratch_limit": self.limits["scratch_limit_bytes"]})
+                    self.store.set_attempt(attempt["id"], "storage_over_cap", result={"scheduler_job": dict(job), "cleanup_verified": True}, error="build exceeded its storage budget")
                 else:
                     self.store.delete_setting(f"build-storage-error:{details['benchmark']}")
             self.store.delete_setting(f"attempt:{attempt['id']}")

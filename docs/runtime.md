@@ -11,11 +11,14 @@ while leaving registry TOML trackable. `config.json` and `enrolled.json` are
 generated workspace-local activation state, not shared registration settings.
 The default retained-data cap is 1 GiB; hosts may
 set a cap up to 4 GiB. Before admission, the coordinator reserves the configured
-128 MiB scratch budget against the retained-data cap. It monitors the full
-managed `.autobench` tree every 500 ms and cancels through Device Scheduler if
-a packet exceeds its scratch budget or the retained cap. The worker limits each
-output file to 64 MiB; a write can briefly exceed the reserved budget before
-the next monitor check. Registration and project data are not eviction targets.
+128 MiB scratch budget against the retained-data cap. The Scheduler-launched
+worker monitors the full managed `.autobench` tree every 500 ms and terminates
+its owned child if a packet exceeds its scratch budget or the retained cap; this
+also applies when the global coordinator is between workspace polls. Device
+Scheduler still controls job cleanup and capacity release. The worker limits
+each output file to 64 MiB; a write can briefly exceed the reserved budget
+before the next monitor check. Registration and project data are not eviction
+targets.
 
 Register one or more bounded packets in `.autobench/registry/<name>.toml`:
 
@@ -46,6 +49,13 @@ Autobench package recipe resources. Packet dependencies use
 `depends_on = ["packet-name"]`; downstream packets wait for current successful
 dependencies. Put compact numeric measurements in `metrics.json` beneath
 `{output}`. Raw reports and any other outputs are retained with the packet.
+
+The worker routes `TMPDIR`, `TMP`, `TEMP`, `XDG_CACHE_HOME`, and
+`CUDA_CACHE_PATH` into monitored per-attempt scratch and removes those temporary
+directories after the command exits. A command may set these variables
+explicitly in its `environment` table; the requested paths must remain inside
+that attempt's `{output}` directory. Other registered environment values retain
+their configured precedence.
 
 Import a full TOML definition through the CLI so it receives the same validation
 as the runtime registry:

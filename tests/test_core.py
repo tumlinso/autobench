@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -58,7 +60,23 @@ class FakeScheduler:
             return {"resources": []}
         if operation == "resources.forecast":
             packet = arguments["request"]["owner_context"]["packet"]
-            return self.forecast_by_packet.get(packet, {"candidates": []})
+            if packet in self.forecast_by_packet:
+                return self.forecast_by_packet[packet]
+            resources = []
+            current = []
+            for requirement in arguments["request"].get("requirements", []):
+                kind = requirement.get("kind")
+                resource_id = requirement.get("selectors", {}).get("resource_id")
+                if not resource_id:
+                    resource_id = "gpu:worker-a:GPU-123" if kind == "gpu" else f"host:worker-a:{kind}"
+                resources.append(resource_id)
+                current.append({"resource_id": resource_id, "kind": kind})
+            return {"candidates": [{"candidate_id": "atomic-request", "feasible": True,
+                                    "feasible_now": True, "resource_ids": resources,
+                                    "earliest_start": datetime.now(timezone.utc).isoformat(),
+                                    "expected_release": None, "available_until": time.time() + 600,
+                                    "window_seconds": 600, "uncertainty_seconds": 0,
+                                    "window_basis": "forecast_horizon_only"}], "current_resources": current}
         raise AssertionError(f"unexpected Scheduler operation {operation}")
 
 
@@ -177,6 +195,70 @@ class AutobenchCoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 execute(manifest)
 
+    def test_worker_kills_oversized_child_within_storage_poll_interval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            managed = project / ".autobench"
+            staged = managed / "scratch" / "attempt-1"
+            staged.mkdir(parents=True)
+            pid_file = project / "child.pid"
+            payload = staged / "large-output.bin"
+            code = "import os,pathlib,time; pathlib.Path(%r).write_bytes(b'x'*1000000); pathlib.Path(%r).write_text(str(os.getpid())); time.sleep(10)" % (str(payload), str(pid_file))
+            manifest = project / "packet.json"
+            manifest.write_text(json.dumps({
+                "argv": [sys.executable, "-c", code],
+                "working_directory": str(project / "src"),
+                "allowed_root": str(project),
+                "managed_root": str(managed),
+                "result_directory": str(staged),
+                "scratch_limit_bytes": 64 * 1024,
+                "retained_cap_bytes": 10 * 1024 * 1024,
+                "output_limit_bytes": 2 * 1024 * 1024,
+                "kill_seconds": 20,
+            }))
+            started = time.monotonic()
+            with patch.dict(os.environ, {"DEVICE_SCHEDULER_JOB_ID": "job-test",
+                                         "DEVICE_SCHEDULER_ATTEMPT_ID": "attempt-test"}):
+                self.assertEqual(execute(manifest), 0)
+            elapsed = time.monotonic() - started
+            result = json.loads((staged / "result.json").read_text())
+            self.assertEqual(result["status"], "storage_over_cap")
+            self.assertLess(elapsed, 3)
+            child_pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+
+    def test_worker_scopes_and_removes_temporary_and_cache_directories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            staged = project / ".autobench/scratch/attempt-1"
+            staged.mkdir(parents=True)
+            observed = project / "observed.json"
+            code = ("import json,os,pathlib; names=['TMPDIR','TMP','TEMP','XDG_CACHE_HOME','CUDA_CACHE_PATH']; "
+                    "paths={n:os.environ[n] for n in names}; "
+                    "[pathlib.Path(v,'marker').write_text('ok') for v in paths.values()]; "
+                    "pathlib.Path(%r).write_text(json.dumps(paths))") % str(observed)
+            manifest = project / "packet.json"
+            manifest.write_text(json.dumps({
+                "argv": [sys.executable, "-c", code],
+                "working_directory": str(project / "src"), "allowed_root": str(project),
+                "managed_root": str(project / ".autobench"), "result_directory": str(staged),
+                "scratch_limit_bytes": 1024 * 1024, "retained_cap_bytes": 8 * 1024 * 1024,
+                "output_limit_bytes": 1024 * 1024, "kill_seconds": 5,
+                "environment": {"TMPDIR": str(staged / "explicit-temp")},
+            }))
+            with patch.dict(os.environ, {"DEVICE_SCHEDULER_JOB_ID": "job-test",
+                                         "DEVICE_SCHEDULER_ATTEMPT_ID": "attempt-test",
+                                         "TMPDIR": "/tmp", "XDG_CACHE_HOME": "/tmp"}):
+                self.assertEqual(execute(manifest), 0)
+            paths = json.loads(observed.read_text())
+            self.assertEqual(Path(paths["TMPDIR"]), staged / "explicit-temp")
+            for path in paths.values():
+                self.assertTrue(Path(path).is_relative_to(staged))
+                self.assertFalse(Path(path).exists(), path)
+
     def test_public_api_initializes_enrolls_and_registers_without_cli_duplication(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
             "XDG_STATE_HOME": str(Path(temp) / "state-home"),
@@ -246,6 +328,10 @@ class AutobenchCoreTests(unittest.TestCase):
                 attempt = engine.store.unresolved()[0]
                 details = engine.store.get(f"attempt:{attempt['id']}")
                 staged = Path(details["staged"])
+                worker_manifest = json.loads(Path(details["manifest"]).read_text())
+                self.assertEqual(worker_manifest["managed_root"], str(autobench))
+                self.assertEqual(worker_manifest["scratch_limit_bytes"], engine.limits["scratch_limit_bytes"])
+                self.assertGreater(worker_manifest["retained_cap_bytes"], 0)
                 staged.mkdir(parents=True, exist_ok=True)
                 (staged / "result.json").write_text(json.dumps({"status": "succeeded", "returncode": 0}))
                 (staged / "metrics.json").write_text(json.dumps({"median_ms": 1.25}))
@@ -320,10 +406,13 @@ class AutobenchCoreTests(unittest.TestCase):
             create_test_store(project).close()
             scheduler = FakeScheduler()
             scheduler.forecast_by_packet["profile"] = {"candidates": [{
-                "feasible": True, "resource_ids": ["gpu:worker-a:GPU-123"],
-                "earliest_start": time.time(), "expected_release": time.time() + 120,
-                "uncertainty_seconds": 0,
-            }]}
+                "candidate_id": "atomic-request", "feasible": True, "feasible_now": True,
+                "resource_ids": ["host:worker-a:cpu", "host:worker-a:memory", "gpu:worker-a:GPU-123"],
+                "earliest_start": datetime.now(timezone.utc).isoformat(), "expected_release": None,
+                "available_until": datetime.now(timezone.utc).timestamp() + 600,
+                "window_seconds": 600, "uncertainty_seconds": 0,
+                "window_basis": "forecast_horizon_only",
+            }], "current_resources": [{"resource_id": "gpu:worker-a:GPU-123", "kind": "gpu"}]}
             engine = Engine(project, scheduler)
             benchmark = type("B", (), {"name": "demo", "revision": 1, "protocol": {}})()
             packet = Command(("python3", "profile.py"), 30, 120,
@@ -344,6 +433,101 @@ class AutobenchCoreTests(unittest.TestCase):
                 self.assertEqual(spec["preconditions"][0]["name"], "gpu.quiescence")
                 from device_scheduler_core import JobSpec
                 JobSpec.from_dict(spec)
+            finally:
+                engine.close()
+
+    def test_reconcile_uses_live_scheduler_atomic_forecast_wire(self):
+        from device_scheduler_adapters.sqlite import Ledger as SchedulerLedger
+        from device_scheduler_core.allocator import ResourceAllocator
+        from device_scheduler_core.application import Scheduler as CoreScheduler, SchedulerConfig
+        from device_scheduler_core.models import Principal, Resource
+
+        class ObservedInventory:
+            adapter_id = "autobench.test.inventory"
+
+            def snapshot(self):
+                stamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                return {
+                    "state": "observed", "observed_at": stamp,
+                    "gpu_inventory": {"state": "observed"},
+                    "process_telemetry": {"state": "observed", "processes": []},
+                    "resources": [
+                        Resource("host:local:cpu", "host:local", "cpu", {"cores": 16}),
+                        Resource("host:local:memory", "host:local", "memory", {"bytes": 32 * 1024**3}),
+                        Resource("gpu:host:GPU-test", "host:local", "gpu", {"memory_bytes": 8 * 1024**3},
+                                 attributes={"uuid": "GPU-test", "memory_free_bytes_observation": 7 * 1024**3,
+                                             "process_count_observation": 0,
+                                             "process_telemetry": "compute-apps-visible"}),
+                    ],
+                }
+
+        class DispatchClient:
+            def __init__(self, scheduler, principal):
+                self.scheduler = scheduler
+                self.principal = principal
+                self.calls = []
+
+            async def call(self, operation, arguments=None):
+                args = dict(arguments or {})
+                self.calls.append((operation, args))
+                return self.scheduler.dispatch(operation, args, self.principal)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "project"
+            root.mkdir()
+            (root / "src").mkdir()
+            (root / "src/kernel.cu").write_text("__global__ void k() {}\n")
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(temp) / "autobench-state")}):
+                init_project(root, agent_instructions="skip")
+            (root / ".autobench/registry/live.toml").write_text('''[benchmark]
+name="live-wire"
+revision=1
+protocol={runner="test-v1"}
+[source]
+include=["src/**"]
+[[packet]]
+name="profile"
+kind="timeline-profile"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
+''', encoding="utf-8")
+
+            ledger = SchedulerLedger(Path(temp) / "scheduler.sqlite3")
+            core = CoreScheduler(
+                ledger, ResourceAllocator(ledger), resource_adapters=(ObservedInventory(),),
+                config=SchedulerConfig(state_root=Path(temp) / "scheduler-state",
+                                       execution_root=root, artifact_root=Path(temp) / "scheduler-artifacts"),
+            )
+            principal = Principal(
+                "agent:one", actions=frozenset({"jobs.submit", "jobs.read", "jobs.control", "jobs.list",
+                                                 "resources.forecast", "history.compact:autobench"}),
+                execution_roots=(str(root),), max_priority=90,
+            )
+            client = DispatchClient(core, principal)
+            engine = Engine(root, client)
+            try:
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:live-wire")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:live-wire", seen)
+                result = asyncio.run(engine.reconcile_once())
+                self.assertEqual(result["state"], "submitted", result)
+                forecast_calls = [args for operation, args in client.calls if operation == "resources.forecast"]
+                self.assertEqual(len(forecast_calls), 1)
+                self.assertEqual(forecast_calls[0]["horizon_seconds"], 600)
+                self.assertEqual(len(forecast_calls[0]["request"]["requirements"]), 3)
+                forecast = core.dispatch("resources.forecast", forecast_calls[0], principal)
+                candidate, = forecast["candidates"]
+                self.assertTrue(candidate["feasible_now"])
+                self.assertEqual(set(candidate["resource_ids"]), {
+                    "host:local:cpu", "host:local:memory", "gpu:host:GPU-test",
+                })
+                submitted = [args["spec"] for operation, args in client.calls if operation == "jobs.submit"]
+                self.assertEqual(len(submitted), 1)
+                self.assertEqual(submitted[0]["resources"][-1]["selectors"], {"resource_id": "gpu:host:GPU-test"})
+                self.assertEqual(submitted[0]["preconditions"][0]["name"], "gpu.quiescence")
             finally:
                 engine.close()
 
@@ -389,6 +573,94 @@ class AutobenchCoreTests(unittest.TestCase):
                     asyncio.run(engine._submit(benchmark, project, project / ".autobench/builds/x", benchmark.packets[0], 0, "fp", "correctness"))
                 self.assertFalse(any(operation == "jobs.submit" for operation, _ in scheduler.calls))
                 self.assertEqual(engine._reserved_bytes(), 0)
+            finally:
+                engine.close()
+
+    def test_two_engine_instances_cannot_submit_same_workspace_concurrently(self):
+        class SlowForecastScheduler(FakeScheduler):
+            async def call(self, operation, arguments=None):
+                if operation == "resources.forecast":
+                    await asyncio.sleep(0.05)
+                return await super().call(operation, arguments)
+
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            (project / "src/input.cu").write_text("kernel")
+            autobench = project / ".autobench"
+            (autobench / "registry").mkdir(parents=True)
+            (autobench / "config.json").write_text("{}")
+            (autobench / "registry/bench.toml").write_text('''[benchmark]\nname="demo"\nrevision=1\n[source]\ninclude=["src/**"]\n[[packet]]\nname="timing"\nargv=["python3","runner.py"]\nexpected_seconds=1\nkill_seconds=5\nresources={cpu_cores=1}\n''')
+            create_test_store(project).close()
+            scheduler = SlowForecastScheduler()
+            first = Engine(project, scheduler)
+            second = Engine(project, scheduler)
+            try:
+                self.assertEqual(asyncio.run(first.reconcile_once())["state"], "idle")
+                seen = first.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                first.store.set("seen:demo", seen)
+                async def run_both():
+                    return await asyncio.gather(first.reconcile_once(), second.reconcile_once())
+
+                results = asyncio.run(run_both())
+                self.assertEqual(sum(result.get("submitted", 0) for result in results), 1)
+                self.assertEqual(sum(result["state"] == "busy" for result in results), 1)
+                self.assertEqual(sum(operation == "jobs.submit" for operation, _ in scheduler.calls), 1)
+                self.assertEqual(len(first.store.unresolved()), 1)
+            finally:
+                first.close()
+                second.close()
+
+    def test_separate_process_respects_workspace_writer_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            engine = Engine(project, FakeScheduler())
+            code = ("from autobench.engine import Engine; from pathlib import Path; "
+                    "import asyncio; e=Engine(Path(r'%s'), object()); "
+                    "print(asyncio.run(e.reconcile_once())['state']); e.close()") % str(project)
+            try:
+                with engine._workspace_writer_lock() as acquired:
+                    self.assertTrue(acquired)
+                    child = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(child.returncode, 0, child.stderr)
+                    self.assertEqual(child.stdout.strip(), "busy")
+            finally:
+                engine.close()
+
+    def test_prepared_attempts_are_cleaned_and_orphans_terminalized(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            engine = Engine(project, FakeScheduler())
+            owned = str(__import__("uuid").uuid4())
+            stage = project / f".autobench/scratch/{owned}"
+            stage.mkdir(parents=True)
+            (stage / "partial").write_text("partial")
+            manifest = project / f".autobench/state/packets/{owned}.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("{}")
+            engine.store.begin_attempt("demo", 1, 0, "fp", attempt_id=owned, state="prepared")
+            engine.store.set(f"attempt:{owned}", {"staged": str(stage), "manifest": str(manifest)})
+            engine.store.set(f"reservation:{owned}", {"bytes": 4096, "baseline_usage": 0})
+            orphan = str(__import__("uuid").uuid4())
+            engine.store.begin_attempt("demo", 1, 1, "orphan", attempt_id=orphan, state="prepared")
+            engine.store.set(f"reservation:{orphan}", 2048)
+            try:
+                asyncio.run(engine.reconcile_once())
+                states = {row["id"]: row["state"] for row in engine.store.db.execute("SELECT id,state FROM attempts")}
+                self.assertEqual(states[owned], "not_submitted")
+                self.assertEqual(states[orphan], "not_submitted")
+                self.assertFalse(stage.exists())
+                self.assertFalse(manifest.exists())
+                self.assertEqual(engine._reserved_bytes(), 0)
+                self.assertIsNone(engine.store.get(f"attempt:{owned}"))
+                self.assertIsNone(engine.store.get(f"attempt:{orphan}"))
             finally:
                 engine.close()
 
@@ -500,10 +772,12 @@ class AutobenchCoreTests(unittest.TestCase):
             scheduler = FakeScheduler()
             now = datetime.now(timezone.utc).timestamp()
             scheduler.forecast_by_packet = {
-                "long": {"candidates": [{"feasible": True, "earliest_start": now,
-                                           "expected_release": now + 10, "uncertainty_seconds": 0}]},
-                "short": {"candidates": [{"feasible": True, "earliest_start": now,
-                                            "expected_release": now + 10, "uncertainty_seconds": 0}]},
+                "long": {"candidates": [{"feasible": True, "feasible_now": True, "earliest_start": now,
+                                           "window_seconds": 10, "uncertainty_seconds": 0,
+                                           "window_basis": "forecast_horizon_only"}]},
+                "short": {"candidates": [{"feasible": True, "feasible_now": True, "earliest_start": now,
+                                            "window_seconds": 10, "uncertainty_seconds": 0,
+                                            "window_basis": "forecast_horizon_only"}]},
             }
             engine = Engine(project, scheduler)
             long = Command(("python3", "long.py"), 15, 30, {"cpu_cores": 1}, name="long")
@@ -517,6 +791,39 @@ class AutobenchCoreTests(unittest.TestCase):
                 self.assertEqual(chosen["command"].name, "short")
                 self.assertTrue(any(op == "resources.forecast" for op, _args in scheduler.calls))
                 self.assertEqual(chosen["identity"]["availability_forecast"]["candidates"][0]["feasible"], True)
+            finally:
+                engine.close()
+
+    def test_future_only_forecast_never_selects_gpu_or_admits_packet(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            scheduler.forecast_by_packet["profile"] = {"candidates": [{
+                "candidate_id": "atomic-request", "feasible": False, "feasible_now": False,
+                "projected_feasible": True, "resource_ids": ["gpu:worker-a:GPU-123"],
+                "earliest_start": datetime.now(timezone.utc).isoformat(),
+                "expected_release": datetime.now(timezone.utc).isoformat(),
+                "available_until": datetime.now(timezone.utc).timestamp() + 600,
+                "window_seconds": 600, "window_basis": "verified_active_job_release",
+            }], "current_resources": [{"resource_id": "gpu:worker-a:GPU-123", "kind": "gpu"}]}
+            engine = Engine(project, scheduler)
+            benchmark = type("B", (), {"name": "demo", "revision": 1, "protocol": {}})()
+            packet = Command(("python3", "profile.py"), 2, 30,
+                             {"gpu_memory_bytes": 1024}, kind="timeline-profile", name="profile")
+            candidate = {"benchmark": benchmark, "command": packet, "index": 0,
+                         "identity": {"data_fingerprint": "fixture-v1"}, "snapshot": project,
+                         "build": project / ".autobench/builds/x", "fingerprint": "fp", "artifacts": {}}
+            try:
+                chosen = asyncio.run(engine._choose_candidate([candidate]))
+                self.assertFalse(chosen["identity"]["forecast_ready"])
+                self.assertEqual(chosen["identity"]["selected_resource_ids"], [])
+                with self.assertRaisesRegex(Exception, "feasible-now forecast-selected"):
+                    asyncio.run(engine._submit(benchmark, project, project / ".autobench/builds/x", packet, 0,
+                                               "fp", "timeline-profile", identity=chosen["identity"]))
+                self.assertFalse(any(operation == "jobs.submit" for operation, _args in scheduler.calls))
             finally:
                 engine.close()
 
