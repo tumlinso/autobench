@@ -38,12 +38,36 @@ def _state(project: Path) -> Path:
     return project / ".autobench" / "state"
 
 
+def _measurement_protocol(benchmark: Benchmark, command: Command, recipe_fingerprint: str) -> dict[str, Any]:
+    resources = {key: value for key, value in command.resources.items() if key != "_environment"}
+    environment = command.resources.get("_environment", {})
+    environment_hashes = {}
+    if isinstance(environment, dict):
+        for key, value in sorted(environment.items()):
+            serialized = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+            environment_hashes[str(key)] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return {
+        "schema_version": 1,
+        "registered": benchmark.protocol or {},
+        "argv": list(command.argv),
+        "kind": command.kind,
+        "resources": resources,
+        "environment_sha256": environment_hashes,
+        "recipe_fingerprint": recipe_fingerprint,
+    }
+
+
+def _protocol_fingerprint(protocol: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(protocol, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
 def _fingerprint(benchmark: Benchmark, source_fingerprint: str, command: Command, data: dict[str, str], recipe_hash: str, build_fingerprint: str | None = None) -> str:
     payload = {"benchmark": benchmark.name, "revision": benchmark.revision,
+               "fingerprint_schema": 2,
                "source": source_fingerprint, "argv": command.argv,
                "expected": command.expected_seconds, "kill": command.kill_seconds,
                "kind": command.kind, "resources": command.resources, "data": data, "recipe": recipe_hash, "build": build_fingerprint,
-               "protocol": benchmark.protocol or {}}
+               "protocol_fingerprint": _protocol_fingerprint(_measurement_protocol(benchmark, command, recipe_hash))}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -475,7 +499,10 @@ class Engine:
         build_retry = self._retry_cooldown(name, -1, build_fp) if build_fp else None
         packets = []
         for index, packet in enumerate(benchmark.packets):
-            expected = _fingerprint(benchmark, source_fingerprint, packet, manifest, _recipe_hash(packet, autobench_root),
+            recipe_fingerprint = _recipe_hash(packet, autobench_root)
+            protocol = _measurement_protocol(benchmark, packet, recipe_fingerprint)
+            protocol_fingerprint = _protocol_fingerprint(protocol)
+            expected = _fingerprint(benchmark, source_fingerprint, packet, manifest, recipe_fingerprint,
                                     hashlib.sha256((str(build_fp) + str(build_output)).encode()).hexdigest() if build_fp and build_output else None)
             actual = self.store.current(benchmark.name, index)
             reasons = []
@@ -488,6 +515,7 @@ class Engine:
             packets.append({"name": packet.name, "kind": packet.kind, "state": "current" if actual == expected and not reasons else "stale_or_missing",
                             "current_fingerprint": actual, "expected_fingerprint": expected, "expected_seconds": packet.expected_seconds,
                             "kill_seconds": packet.kill_seconds, "depends_on": list(packet.depends_on), "reasons": reasons,
+                            "protocol_fingerprint": protocol_fingerprint,
                             "retry_cooldown": self._retry_cooldown(name, index, expected)})
             retry = packets[-1]["retry_cooldown"]
             if retry and retry["blocked"]:
@@ -682,16 +710,26 @@ class Engine:
                     # This registration now needs the new build. If quota pressure
                     # requires it, the older cache is reproducible and can be evicted.
                     self.store.set(f"last-good-build:{benchmark.name}", str(build_dir))
-                    await self._submit(benchmark, source.directory, build_dir, benchmark.build, -1, build_fp or "", kind="build")
+                    build_protocol = _measurement_protocol(benchmark, benchmark.build,
+                                                           _recipe_hash(benchmark.build, autobench_root))
+                    await self._submit(benchmark, source.directory, build_dir, benchmark.build, -1,
+                                       build_fp or "", kind="build",
+                                       identity={"protocol": build_protocol,
+                                                 "protocol_fingerprint": _protocol_fingerprint(build_protocol),
+                                                 "source_fingerprint": source.fingerprint,
+                                                 "build_fingerprint": build_fp})
                     return {"state": "submitted", "reconciled": reconciled, "benchmark": benchmark.name, "kind": "build", "submitted": 1}
                 data_manifest = {p: source.manifest[p] for p in source.manifest if any(fnmatch.fnmatchcase(p, pat) or Path(p).match(pat) for pat in benchmark.data)}
+                recipe_fingerprint = _recipe_hash(packet, autobench_root)
+                protocol = _measurement_protocol(benchmark, packet, recipe_fingerprint)
                 candidates.append({"benchmark": benchmark, "snapshot": source.directory, "build": build_dir,
                                    "command": packet, "index": index, "fingerprint": fingerprint,
                                    "artifacts": artifacts, "identity": {
                                        "source_fingerprint": source.fingerprint, "source_manifest": source.manifest,
                                        "data_manifest": data_manifest,
                                        "data_fingerprint": hashlib.sha256(json.dumps(data_manifest, sort_keys=True).encode()).hexdigest(),
-                                       "protocol": benchmark.protocol or {}, "build_fingerprint": build_fp,
+                                       "protocol": protocol, "protocol_fingerprint": _protocol_fingerprint(protocol),
+                                       "source_fingerprint": source.fingerprint, "build_fingerprint": build_fp,
                                        "build_output_identity": build_output_identity,
                                        "setup_key": hashlib.sha256(json.dumps({"build": build_fp, "data": data_manifest}, sort_keys=True).encode()).hexdigest()}})
         if candidates:
@@ -834,7 +872,9 @@ class Engine:
 
     def _expected_duration(self, benchmark: Benchmark, packet_index: int, command: Command,
                            identity: dict[str, Any]) -> float:
-        protocol = hashlib.sha256(json.dumps(identity.get("protocol", {}), sort_keys=True).encode()).hexdigest()
+        protocol = identity.get("protocol_fingerprint")
+        if not isinstance(protocol, str):
+            protocol = _protocol_fingerprint(identity.get("protocol", {}))
         data = identity.get("data_fingerprint")
         requested_devices = sorted(identity.get("selected_resource_ids", []))
         samples: list[float] = []
@@ -845,7 +885,9 @@ class Engine:
                 report = json.loads(row.get("result_json") or "{}")
                 observed = report.get("identity", {})
                 worker = report.get("worker", {})
-                devices = sorted(item.get("resource_id") for item in observed.get("device_identity", []) if isinstance(item, dict))
+                devices = sorted(item.get("resource_id") for item in observed.get("device_identity", [])
+                                 if isinstance(item, dict) and item.get("kind") == "gpu"
+                                 and isinstance(item.get("resource_id"), str))
                 duration = worker.get("duration_seconds")
                 if (observed.get("protocol_fingerprint") == protocol and observed.get("data_fingerprint") == data and
                     devices == requested_devices and isinstance(duration, (int, float)) and duration > 0):
@@ -1007,11 +1049,14 @@ class Engine:
             scheduler_state = str(job.get("state", "")).casefold()
             scheduler_attempt = job.get("attempt") if isinstance(job.get("attempt"), dict) else {}
             scheduler_attempt_result = scheduler_attempt.get("result") if isinstance(scheduler_attempt.get("result"), dict) else {}
+            scheduler_result = job.get("result") if isinstance(job.get("result"), dict) else {}
             preemption = scheduler_attempt.get("preemption") if isinstance(scheduler_attempt.get("preemption"), dict) else {}
-            cancellation_reason = scheduler_attempt_result.get("cancellation_reason", "")
+            cancellation_reasons = (scheduler_attempt_result.get("cancellation_reason", ""),
+                                    scheduler_result.get("cancellation_reason", ""))
             blocked_reason = job.get("blocked_reason", "")
             preempted = (scheduler_state == "preempted" or bool(preemption) or
-                         (isinstance(cancellation_reason, str) and cancellation_reason.startswith("preempted_for:")) or
+                         any(isinstance(reason, str) and reason.startswith(("preempted_for:", "priority_lease_demand:"))
+                             for reason in cancellation_reasons) or
                          (isinstance(blocked_reason, str) and blocked_reason.startswith("preempted_for:")))
             success = scheduler_state in {"succeeded", "completed"} and result.get("status") == "succeeded"
             if success and details.get("kind") != "build":
@@ -1073,7 +1118,9 @@ class Engine:
                     else:
                         self.store.set(f"packet-storage-error:{details['benchmark']}:{int(details['packet_index'])}", failure_record)
             device_identity = _device_identity(job)
-            protocol_fingerprint = hashlib.sha256(json.dumps(details.get("protocol", {}), sort_keys=True).encode()).hexdigest()
+            protocol_fingerprint = details.get("protocol_fingerprint")
+            if not isinstance(protocol_fingerprint, str):
+                protocol_fingerprint = _protocol_fingerprint(details.get("protocol", {}))
             diagnostic_error = None
             if state not in {"succeeded", "build_succeeded", "preempted"}:
                 diagnostic_error = str(result.get("error") or f"worker result: {result.get('status', state)}")
@@ -1082,6 +1129,8 @@ class Engine:
                     diagnostic_error += ": " + _bounded_tail(stderr_tail, 1024)[0]
             self.store.set_attempt(attempt["id"], state, {"job": _compact_scheduler_job(dict(job)), "worker": result,
                                                             "identity": {"protocol_fingerprint": protocol_fingerprint,
+                                                                         "source_fingerprint": details.get("source_fingerprint"),
+                                                                         "build_fingerprint": details.get("build_fingerprint"),
                                                                          "data_fingerprint": details.get("data_fingerprint"),
                                                                          "device_identity": device_identity}},
                                    error=diagnostic_error)
@@ -1144,7 +1193,7 @@ class Engine:
                    "source_fingerprint": details.get("source_fingerprint"), "source_manifest_ref": manifest_ref,
                    "data_fingerprint": details.get("data_fingerprint"), "data_manifest": details.get("data_manifest"),
                    "protocol": details.get("protocol", {}),
-                   "protocol_fingerprint": hashlib.sha256(json.dumps(details.get("protocol", {}), sort_keys=True).encode()).hexdigest(),
+                   "protocol_fingerprint": details.get("protocol_fingerprint") or _protocol_fingerprint(details.get("protocol", {})),
                    "build_fingerprint": details.get("build_fingerprint"), "build_output_identity": details.get("build_output_identity"),
                    "device_identity": device, "scheduler_job_id": job.get("id", job.get("job_id")),
                    "cleanup_verified": job.get("cleanup_verified") is True}

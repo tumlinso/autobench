@@ -181,7 +181,7 @@ async def _async_action(args: argparse.Namespace) -> int:
     if args.command == "status":
         result = workspace_status(project)
     elif args.command == "results":
-        result = workspace_results(project, args.name, detailed=args.details)
+        result = workspace_results(project, args.name, detailed=args.details, limit=args.limit)
     elif args.command == "compare":
         result = workspace_compare(project, args.name)
     elif args.command == "explain":
@@ -257,6 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--project", default=".")
         if name == "results":
             p.add_argument("--details", action="store_true", help="include full retained attempt rows and Scheduler receipts")
+            p.add_argument("--limit", type=int, help="maximum recent rows (1-100; compact defaults to 16, details to 100)")
     for name in ("pause", "resume"):
         p = sub.add_parser(name)
         p.add_argument("--project", default=".")

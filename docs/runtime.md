@@ -166,5 +166,8 @@ outputs per packet; older reports are eligible for cleanup. Registration files,
 current evidence, active outputs, and unresolved attempt records are preserved.
 `autobench results`, `compare`, and `explain` read project-local Autobench
 evidence and do not append to a shared evidence store. Results are compact
-agent-facing summaries by default; `autobench results <name> --details` and
-`workspace_results(..., detailed=True)` opt into full retained attempt rows.
+agent-facing summaries of the 16 most recent attempts by default. Set
+`limit=1..100` in `workspace_results` or pass `--limit` to select another
+bounded window. `autobench results <name> --details` and
+`workspace_results(..., detailed=True)` opt into full retained attempt rows
+(100 by default).

@@ -150,17 +150,34 @@ def workspace_status(project: str | Path = ".") -> dict[str, Any]:
         engine.close()
 
 
-def _compact_metrics(value: Any, limit: int = 64) -> dict[str, float | int]:
+def _compact_metrics(value: Any, limit: int = 64, max_depth: int = 6,
+                     max_path_chars: int = 160) -> dict[str, float | int]:
     if not isinstance(value, dict):
         return {}
     compact: dict[str, float | int] = {}
-    for key in sorted(value):
-        metric = value[key]
-        if (isinstance(key, str) and len(key) <= 128 and isinstance(metric, (int, float))
-                and not isinstance(metric, bool) and math.isfinite(metric)):
-            compact[key] = metric
-            if len(compact) >= limit:
-                break
+
+    def visit(node: dict[str, Any], path: tuple[str, ...], depth: int) -> None:
+        if depth >= max_depth or len(compact) >= limit:
+            return
+        for key in sorted(node):
+            if not isinstance(key, str) or not key or len(key) > 64:
+                continue
+            full_path = (*path, key)
+            dotted = ".".join(full_path)
+            if len(dotted) > max_path_chars:
+                continue
+            metric = node[key]
+            if (isinstance(metric, (int, float)) and not isinstance(metric, bool)
+                    and math.isfinite(metric)):
+                compact[dotted] = metric
+                if len(compact) >= limit:
+                    return
+            elif isinstance(metric, dict):
+                visit(metric, full_path, depth + 1)
+                if len(compact) >= limit:
+                    return
+
+    visit(value, (), 0)
     return compact
 
 
@@ -174,23 +191,40 @@ def _tail(value: Any, max_bytes: int = 512) -> str | None:
 def _compact_attempt(root: Path, name: str, row: dict[str, Any], packet_names: dict[int, str], current_fp: str | None) -> dict[str, Any]:
     packet_index = int(row.get("packet_index", -1))
     fingerprint = str(row.get("fingerprint", ""))
+    attempt_id = row.get("id")
+    job_id = row.get("job_id")
     evidence_dir = root / ".autobench" / "evidence" / name / str(packet_index)
     artifact_dir = evidence_dir / fingerprint if fingerprint else None
-    artifact_ref = None
-    if artifact_dir is not None and artifact_dir.is_dir():
-        artifact_ref = artifact_dir.relative_to(root).as_posix()
 
     pointer: dict[str, Any] = {}
     evidence_role = None
     for pointer_name in ("current.json", "baseline.json"):
         try:
-            candidate = json.loads((evidence_dir / pointer_name).read_text(encoding="utf-8"))
+            pointer_path = evidence_dir / pointer_name
+            if pointer_path.stat().st_size > 256 * 1024:
+                continue
+            candidate = json.loads(pointer_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(candidate, dict) and candidate.get("fingerprint") == fingerprint:
+        if (isinstance(candidate, dict) and candidate.get("fingerprint") == fingerprint and
+                candidate.get("attempt") == attempt_id):
             pointer = candidate
             evidence_role = "selected_current" if pointer_name == "current.json" else "baseline"
             break
+
+    artifact_ref = None
+    artifact_matches_attempt = False
+    artifact_result_path = artifact_dir / "result.json" if artifact_dir is not None else None
+    if pointer and artifact_dir is not None and artifact_dir.is_dir() and job_id:
+        try:
+            if artifact_result_path is not None and artifact_result_path.stat().st_size <= 64 * 1024:
+                artifact_result = json.loads(artifact_result_path.read_text(encoding="utf-8"))
+                artifact_matches_attempt = (isinstance(artifact_result, dict) and
+                                            artifact_result.get("scheduler_job_id") == job_id)
+        except (OSError, json.JSONDecodeError):
+            pass
+        if artifact_matches_attempt:
+            artifact_ref = artifact_dir.relative_to(root).as_posix()
 
     try:
         result = json.loads(row.get("result_json") or "{}")
@@ -207,8 +241,8 @@ def _compact_attempt(root: Path, name: str, row: dict[str, Any], packet_names: d
                 continue
             short_device.append({key: descriptor[key] for key in ("resource_id", "uuid", "host_id", "kind")
                                 if isinstance(descriptor.get(key), (str, int, float))})
-    metrics: Any = pointer.get("metrics", {})
-    metrics_path = artifact_dir / "metrics.json" if artifact_dir is not None else None
+    metrics: Any = pointer.get("metrics", {}) if artifact_matches_attempt else {}
+    metrics_path = artifact_dir / "metrics.json" if artifact_matches_attempt and artifact_dir is not None else None
     if metrics_path is not None:
         try:
             if metrics_path.stat().st_size <= 64 * 1024:
@@ -230,7 +264,7 @@ def _compact_attempt(root: Path, name: str, row: dict[str, Any], packet_names: d
             "protocol_fingerprint": identity.get("protocol_fingerprint", pointer.get("protocol_fingerprint")),
             "device_identity": short_device,
         },
-        "evidence_role": evidence_role or ("selected_current" if fingerprint and fingerprint == current_fp else None),
+        "evidence_role": evidence_role,
     }
     if artifact_ref is not None:
         compact["artifact_ref"] = artifact_ref
@@ -240,8 +274,15 @@ def _compact_attempt(root: Path, name: str, row: dict[str, Any], packet_names: d
 
 
 def workspace_results(project: str | Path = ".", name: str = "all", *,
-                      detailed: bool = False) -> dict[str, list[dict[str, Any]]]:
-    """Return compact attempt evidence, or raw ledger rows when detailed=True."""
+                      detailed: bool = False, limit: int | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Return compact attempt evidence; detailed=True opts into raw ledger rows.
+
+    Compact queries default to 16 recent attempts. Detailed queries default to
+    the legacy 100 row bound. An explicit limit may be from 1 through 100.
+    """
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100):
+        raise ValueError("results limit must be an integer from 1 to 100")
+    effective_limit = limit if limit is not None else (100 if detailed else 16)
     root = _workspace_root(project)
     registrations = load_registry(root)
     names = [benchmark.name for benchmark in registrations] if name == "all" else [name]
@@ -251,7 +292,10 @@ def workspace_results(project: str | Path = ".", name: str = "all", *,
     try:
         output = {}
         for benchmark in names:
-            rows = store.attempts_for(benchmark)
+            rows = [dict(row) for row in store.db.execute(
+                "SELECT * FROM attempts WHERE benchmark=? ORDER BY created DESC LIMIT ?",
+                (benchmark, effective_limit),
+            )]
             if detailed:
                 output[benchmark] = rows
                 continue
@@ -290,7 +334,15 @@ def workspace_compare(project: str | Path, name: str) -> dict[str, Any]:
         current_metrics = current.get("metrics", {})
         baseline_metrics = baseline.get("metrics", {})
         differences = []
-        if current.get("protocol_fingerprint") != baseline.get("protocol_fingerprint"):
+        def has_complete_protocol(record: dict[str, Any]) -> bool:
+            protocol = record.get("protocol")
+            return (isinstance(record.get("protocol_fingerprint"), str) and
+                    isinstance(protocol, dict) and protocol.get("schema_version") == 1 and
+                    isinstance(protocol.get("argv"), list) and
+                    isinstance(protocol.get("recipe_fingerprint"), str))
+        if not has_complete_protocol(current) or not has_complete_protocol(baseline):
+            differences.append("measurement protocol identity is incomplete")
+        elif current.get("protocol_fingerprint") != baseline.get("protocol_fingerprint"):
             differences.append("measurement protocol differs")
         if current.get("data_fingerprint") != baseline.get("data_fingerprint"):
             differences.append("registered data identity differs")

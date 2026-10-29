@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from autobench.engine import Engine, _device_identity, _scheduler_resources
+from autobench.engine import (Engine, _device_identity, _measurement_protocol,
+                              _protocol_fingerprint, _scheduler_resources)
 from autobench.errors import RegistrationError, UnsafeWorkspace
 from autobench.instructions import BLOCK, update_agent_instructions
 from autobench.registry import load_registry, parse_registration
@@ -27,7 +28,7 @@ from autobench.api import (init_project, pause_project, reconcile_project, regis
                            register_definition, resume_project, workspace_compare,
                            workspace_explain, workspace_results, workspace_status)
 from autobench.catalog import Catalog
-from autobench.models import Command
+from autobench.models import Benchmark, Command
 from autobench.source_trace import SourceTrace
 
 
@@ -364,10 +365,15 @@ resources={cpu_cores=1}
 
             packet_dir = project / ".autobench/evidence/demo/0"
             packet_dir.mkdir(parents=True)
-            identity = {"protocol_fingerprint": "protocol-v1", "data_fingerprint": "fixture-v1",
+            registered = load_registry(project)[0]
+            protocol = _measurement_protocol(registered, registered.packets[0], "recipe-v1")
+            protocol_fp = _protocol_fingerprint(protocol)
+            identity = {"protocol": protocol, "protocol_fingerprint": protocol_fp,
+                        "source_fingerprint": "source-current", "data_fingerprint": "fixture-v1",
                         "device_identity": [{"resource_id": "gpu:host:GPU-test"}]}
-            for filename, value in (("current.json", 2.0), ("baseline.json", 1.0)):
-                (packet_dir / filename).write_text(json.dumps({**identity, "metrics": {"median_ms": value}}))
+            baseline_identity = {**identity, "source_fingerprint": "source-baseline"}
+            for filename, value, record in (("current.json", 2.0, identity), ("baseline.json", 1.0, baseline_identity)):
+                (packet_dir / filename).write_text(json.dumps({**record, "metrics": {"median_ms": value}}))
             comparison = workspace_compare(project, "demo")
             self.assertTrue(comparison["comparisons"][0]["comparable"])
             stdout = io.StringIO()
@@ -433,16 +439,25 @@ kill_seconds=5
                                  "device_identity": [{"resource_id": "gpu:host:GPU-1", "uuid": "GPU-1",
                                                       "host_id": "host", "kind": "gpu", "attributes": {"large": "x" * 2000}}]},
                 }
+                store.set_job(attempt, "job-1", "succeeded")
                 store.set_attempt(attempt, "succeeded", raw_result)
                 store.mark_current("demo", 0, fingerprint, attempt)
             finally:
                 store.close()
             artifact = project / ".autobench/evidence/demo/0" / fingerprint
             artifact.mkdir(parents=True)
-            (artifact / "metrics.json").write_text(json.dumps({"median_ms": 2.5, "sample_count": 40,
-                                                                  "label": "discard nonnumeric", "truth": True}))
+            early_numeric_fields = {f"a_fixture_{index:02d}": index for index in range(50)}
+            (artifact / "metrics.json").write_text(json.dumps({
+                **early_numeric_fields, "median_ms": 2.5, "sample_count": 40,
+                "timings_ms": {"cuda_complete_postings_bitmap_workset": {
+                    "median_ms": 0.662527978, "samples_ms": [0.6, 0.7]}},
+                "capture": {"bytes": 48192},
+                "argv": ["python", "profile.py"], "label": "discard nonnumeric", "truth": True,
+            }))
+            (artifact / "result.json").write_text(json.dumps({"scheduler_job_id": "job-1", "status": "succeeded"}))
             (artifact.parent / "current.json").write_text(json.dumps({
-                "fingerprint": fingerprint, "metrics": {"median_ms": 2.5, "sample_count": 40},
+                "fingerprint": fingerprint, "attempt": attempt,
+                "metrics": {"median_ms": 2.5, "sample_count": 40},
                 "source_fingerprint": "source-fp", "build_fingerprint": "build-fp",
                 "data_fingerprint": "data-fp", "protocol_fingerprint": "protocol-fp",
                 "device_identity": [{"resource_id": "gpu:host:GPU-1", "uuid": "GPU-1",
@@ -451,9 +466,11 @@ kill_seconds=5
 
             compact = workspace_results(project, "demo")["demo"][0]
             self.assertEqual({key: compact[key] for key in ("id", "job_id", "packet_index", "state")},
-                             {"id": attempt, "job_id": None, "packet_index": 0, "state": "succeeded"})
+                             {"id": attempt, "job_id": "job-1", "packet_index": 0, "state": "succeeded"})
             self.assertEqual(compact["packet_name"], "profile")
-            self.assertEqual(compact["metrics"], {"median_ms": 2.5, "sample_count": 40})
+            self.assertLessEqual(len(compact["metrics"]), 64)
+            self.assertEqual(compact["metrics"]["timings_ms.cuda_complete_postings_bitmap_workset.median_ms"], 0.662527978)
+            self.assertEqual(compact["metrics"]["capture.bytes"], 48192)
             self.assertEqual(compact["duration_seconds"], 12.5)
             self.assertEqual(compact["identity"]["source_fingerprint"], "source-fp")
             self.assertEqual(compact["identity"]["build_fingerprint"], "build-fp")
@@ -467,6 +484,13 @@ kill_seconds=5
             self.assertNotIn("private raw", encoded_compact)
             self.assertLess(len(encoded_compact), 3000)
 
+            (artifact / "result.json").write_text(json.dumps({"scheduler_job_id": "another-job"}))
+            unverified_artifact = workspace_results(project, "demo")["demo"][0]
+            self.assertEqual(unverified_artifact["metrics"], {})
+            self.assertEqual(unverified_artifact["evidence_role"], "selected_current")
+            self.assertNotIn("artifact_ref", unverified_artifact)
+            (artifact / "result.json").write_text(json.dumps({"scheduler_job_id": "job-1", "status": "succeeded"}))
+
             detailed = workspace_results(project, "demo", detailed=True)["demo"][0]
             self.assertIn("source_manifest", detailed["result_json"])
             self.assertIn("receipt", detailed["result_json"])
@@ -476,6 +500,65 @@ kill_seconds=5
                 with redirect_stdout(stdout):
                     self.assertEqual(cli_main(args), 0)
                 self.assertEqual(json.loads(stdout.getvalue()), expected)
+
+            # A later failed attempt may share the same fingerprint, but must
+            # not inherit the successful attempt's selected evidence or metrics.
+            store = Store(project / ".autobench/state/autobench.sqlite3", create=False)
+            try:
+                failed = store.begin_attempt("demo", 1, 0, fingerprint)
+                store.set_job(failed, "job-2", "preempted")
+                store.set_attempt(failed, "preempted", {"worker": {"status": "missing_result"}})
+            finally:
+                store.close()
+            failed_compact = workspace_results(project, "demo")["demo"][0]
+            self.assertEqual(failed_compact["id"], failed)
+            self.assertEqual(failed_compact["metrics"], {})
+            self.assertIsNone(failed_compact["evidence_role"])
+            self.assertNotIn("artifact_ref", failed_compact)
+
+    def test_compact_results_default_to_sixteen_with_explicit_bounded_limit(self):
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(Path(temp) / "state-home"),
+            "XDG_CONFIG_HOME": str(Path(temp) / "config-home"),
+        }):
+            project = Path(temp) / "project"
+            project.mkdir()
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value=1\n")
+            init_project(project, agent_instructions="skip", activate=False)
+            registration = project / "definition.toml"
+            registration.write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=1
+kill_seconds=5
+''')
+            register_definition(project, registration)
+            store = Store(project / ".autobench/state/autobench.sqlite3", create=False)
+            try:
+                for index in range(20):
+                    attempt = store.begin_attempt("demo", 1, 0, f"fp-{index:02d}")
+                    store.set_attempt(attempt, "failed", error=f"failure-{index}")
+            finally:
+                store.close()
+
+            self.assertEqual(len(workspace_results(project, "demo")["demo"]), 16)
+            self.assertEqual(len(workspace_results(project, "demo", limit=5)["demo"]), 5)
+            self.assertEqual(len(workspace_results(project, "demo", detailed=True)["demo"]), 20)
+            with self.assertRaisesRegex(ValueError, "1 to 100"):
+                workspace_results(project, "demo", limit=101)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(cli_main(["results", "demo", "--limit", "5", "--project", str(project)]), 0)
+            self.assertEqual(len(json.loads(stdout.getvalue())["demo"]), 5)
 
     def test_cli_init_does_not_activate_when_scheduler_grants_are_missing_or_unreachable(self):
         import io
@@ -664,6 +747,51 @@ resources={cpu_cores=1}
                 self.assertTrue(fallback["diagnostics"]["stderr_truncated"])
                 self.assertLessEqual(len(fallback["diagnostics"]["stderr_tail"].encode()), 8 * 1024)
                 self.assertTrue(fallback["diagnostics"]["stderr_tail"].endswith("scheduler-stderr"))
+            finally:
+                engine.close()
+
+    def test_priority_lease_demand_cancellation_is_preemption_not_packet_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value=1\n")
+            autobench = project / ".autobench"
+            (autobench / "registry").mkdir(parents=True)
+            (autobench / "config.json").write_text("{}")
+            (autobench / "registry/demo.toml").write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1}
+''')
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            engine = Engine(project, scheduler)
+            try:
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "submitted")
+                attempt = engine.store.unresolved()[0]
+                scheduler.job = {
+                    "id": "job-1", "state": "cancelled", "cleanup_verified": True,
+                    "result": {"cancellation_reason": "priority_lease_demand:interactive-request"},
+                    "attempt": {"result": {"cancellation_reason": "priority_lease_demand:interactive-request",
+                                             "cleanup_verified": True}},
+                }
+                self.assertEqual(asyncio.run(engine._reconcile_jobs()), 1)
+                row = next(item for item in engine.store.attempts_for("demo") if item["id"] == attempt["id"])
+                self.assertEqual(row["state"], "preempted")
+                self.assertIsNone(engine._retry_cooldown("demo", 0, attempt["fingerprint"]))
+                self.assertIsNone(engine.store.current("demo", 0))
+                self.assertFalse((autobench / "evidence/demo/0/current.json").exists())
             finally:
                 engine.close()
 
@@ -863,19 +991,79 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
             engine = Engine(project, FakeScheduler())
             benchmark = type("B", (), {"name": "demo"})()
             command = Command(("python3", "run.py"), 5, 30, {}, name="timing")
-            protocol_fp = __import__("hashlib").sha256(b"{}").hexdigest()
+            protocol = {"schema_version": 1, "argv": list(command.argv), "kind": command.kind,
+                        "resources": {}, "environment_sha256": {}, "recipe_fingerprint": "recipe-v1"}
+            protocol_fp = _protocol_fingerprint(protocol)
+            actual_grant = _device_identity({"attempt": {"execution_context": {
+                "allocations": [
+                    {"resource_id": "gpu:worker-a:GPU-1", "quantities": {"memory_bytes": 100}},
+                    {"resource_id": "host:worker-a:cpu", "quantities": {"cores": 4}},
+                    {"resource_id": "host:worker-a:memory", "quantities": {"bytes": 4096}},
+                ],
+                "resources": [
+                    {"resource_id": "gpu:worker-a:GPU-1", "kind": "gpu", "attributes": {"uuid": "GPU-1"}},
+                    {"resource_id": "host:worker-a:cpu", "kind": "cpu"},
+                    {"resource_id": "host:worker-a:memory", "kind": "memory"},
+                ],
+            }}})
             for i, (duration, data, state) in enumerate(((10, "d1", "succeeded"), (20, "d1", "succeeded"), (100, "other", "succeeded"), (90, "d1", "failed"))):
                 attempt_id = engine.store.begin_attempt("demo", 1, 0, f"fp{i}")
                 engine.store.set_attempt(attempt_id, state, {"worker": {"duration_seconds": duration},
                                                              "identity": {"protocol_fingerprint": protocol_fp,
                                                                           "data_fingerprint": data,
-                                                                          "device_identity": []}})
+                                                                          "device_identity": actual_grant}})
             try:
                 estimate = engine._expected_duration(benchmark, 0, command,
-                                                     {"protocol": {}, "data_fingerprint": "d1", "selected_resource_ids": []})
+                                                     {"protocol": protocol, "protocol_fingerprint": protocol_fp,
+                                                      "data_fingerprint": "d1",
+                                                      "selected_resource_ids": ["gpu:worker-a:GPU-1"]})
                 self.assertEqual(estimate, 24)
             finally:
                 engine.close()
+
+    def test_measurement_protocol_tracks_command_recipe_and_not_source(self):
+        benchmark = Benchmark(name="demo", revision=1, root=Path("."), include=("src/**",),
+                              data=(), build=None, packets=(), protocol={"warmup": 2, "samples": 7})
+        first = Command(("python3", "bench.py", "--warmup", "2", "--samples", "7"), 5, 30,
+                        {"cpu_cores": 1, "_environment": {"API_TOKEN": "secret-a"}}, kind="timing")
+        same = Command(first.argv, 5, 30,
+                       {"cpu_cores": 1, "_environment": {"API_TOKEN": "secret-a"}}, kind="timing")
+        warmup_changed = Command(("python3", "bench.py", "--warmup", "3", "--samples", "7"), 5, 30,
+                                 {"cpu_cores": 1, "_environment": {"API_TOKEN": "secret-a"}}, kind="timing")
+        protocol = _measurement_protocol(benchmark, first, "recipe-a")
+        self.assertEqual(_protocol_fingerprint(protocol),
+                         _protocol_fingerprint(_measurement_protocol(benchmark, same, "recipe-a")))
+        self.assertNotEqual(_protocol_fingerprint(protocol),
+                            _protocol_fingerprint(_measurement_protocol(benchmark, warmup_changed, "recipe-a")))
+        self.assertNotEqual(_protocol_fingerprint(protocol),
+                            _protocol_fingerprint(_measurement_protocol(benchmark, first, "recipe-b")))
+        self.assertNotIn("secret-a", json.dumps(protocol))
+        self.assertNotEqual(_protocol_fingerprint(protocol), _protocol_fingerprint({}))
+        # Source/build/data are independent identity dimensions; changing source
+        # does not alter the measurement protocol itself.
+        self.assertEqual(_protocol_fingerprint(protocol),
+                         _protocol_fingerprint(_measurement_protocol(benchmark, first, "recipe-a")))
+
+    def test_compare_rejects_legacy_empty_protocol_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            target = project / ".autobench/evidence/bench/0"
+            target.mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            modern = {"schema_version": 1, "registered": {}, "argv": ["python3", "bench.py"],
+                      "kind": "timing", "resources": {}, "environment_sha256": {},
+                      "recipe_fingerprint": "recipe-v1"}
+            current = {"metrics": {"median_ms": 2.0}, "protocol": modern,
+                       "protocol_fingerprint": _protocol_fingerprint(modern),
+                       "data_fingerprint": "fixture", "device_identity": [{"resource_id": "gpu:host:GPU-test"}]}
+            legacy = {**current, "metrics": {"median_ms": 1.0}, "protocol": {},
+                      "protocol_fingerprint": _protocol_fingerprint({})}
+            (target / "current.json").write_text(json.dumps(current))
+            (target / "baseline.json").write_text(json.dumps(legacy))
+            result = workspace_compare(project, "bench")["comparisons"][0]
+            self.assertFalse(result["comparable"])
+            self.assertIn("measurement protocol identity is incomplete", result["reasons"])
 
     def test_retained_cap_reserves_scratch_before_admission(self):
         with tempfile.TemporaryDirectory() as temp:
