@@ -795,6 +795,65 @@ resources={cpu_cores=1}
             finally:
                 engine.close()
 
+    def test_worker_storage_stop_cancels_unknown_scheduler_job_until_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value=1\n")
+            autobench = project / ".autobench"
+            (autobench / "registry").mkdir(parents=True)
+            (autobench / "config.json").write_text("{}")
+            (autobench / "registry/demo.toml").write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1}
+''')
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            engine = Engine(project, scheduler)
+            engine.limits["scratch_limit_bytes"] = 1024 * 1024
+            engine.store.set("retained_cap_bytes", 10 * 1024 * 1024)
+            try:
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "submitted")
+                attempt = engine.store.unresolved()[0]
+                staged = autobench / "scratch" / attempt["id"]
+                staged.mkdir(parents=True, exist_ok=True)
+                (staged / "result.json").write_text(json.dumps({"status": "storage_over_cap", "returncode": 125}))
+                usage = sum(path.stat().st_size for path in autobench.rglob("*") if path.is_file())
+                self.assertLess(usage + engine._reserved_bytes(usage), 10 * 1024 * 1024)
+
+                self.assertEqual(asyncio.run(engine._reconcile_jobs()), 0)
+                self.assertEqual([args["action"] for operation, args in scheduler.calls if operation == "jobs.control"], ["cancel"])
+                self.assertTrue(engine.store.get(f"cancel_requested:{attempt['id']}"))
+                self.assertGreater(engine._reserved_bytes(), 0)
+                self.assertEqual(engine.store.current("demo", 0), None)
+
+                # A still-running Scheduler record must not trigger duplicate cancel requests.
+                self.assertEqual(asyncio.run(engine._reconcile_jobs()), 0)
+                self.assertEqual(sum(operation == "jobs.control" for operation, _ in scheduler.calls), 1)
+                self.assertGreater(engine._reserved_bytes(), 0)
+
+                scheduler.job = {"id": "job-1", "state": "cancelled", "cleanup_verified": True}
+                self.assertEqual(asyncio.run(engine._reconcile_jobs()), 1)
+                row = next(item for item in engine.store.attempts_for("demo") if item["id"] == attempt["id"])
+                self.assertEqual(row["state"], "storage_over_cap")
+                self.assertEqual(engine._reserved_bytes(), 0)
+                self.assertIsNone(engine.store.current("demo", 0))
+                self.assertFalse((autobench / "evidence/demo/0/current.json").exists())
+            finally:
+                engine.close()
+
     def test_scheduler_wire_requirements_match_actual_inventory_dto_and_allocator(self):
         try:
             from device_scheduler_adapters import Ledger

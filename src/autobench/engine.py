@@ -1034,7 +1034,17 @@ class Engine:
             if not terminal(job):
                 self.store.set_attempt(attempt["id"], "running" if str(job.get("state", "")).lower() in {"running", "active"} else "submitted")
                 usage = _disk_usage(self.autobench)
-                if (_disk_usage(self.autobench / "scratch" / attempt["id"]) > self.limits["scratch_limit_bytes"] or
+                staged = self.autobench / "scratch" / attempt["id"]
+                worker_status = None
+                try:
+                    worker_result = json.loads((staged / "result.json").read_text(encoding="utf-8"))
+                    if isinstance(worker_result, dict):
+                        worker_status = worker_result.get("status")
+                except (OSError, json.JSONDecodeError):
+                    pass
+                worker_stopped = worker_status in {"storage_over_cap", "timed_out"}
+                if (worker_stopped or
+                    _disk_usage(staged) > self.limits["scratch_limit_bytes"] or
                     usage + self._reserved_bytes(usage) > min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])) and not self.store.get(f"cancel_requested:{attempt['id']}", False):
                     await self.scheduler.call("jobs.control", {"job_id": attempt["job_id"], "action": "cancel"})
                     self.store.set(f"cancel_requested:{attempt['id']}", True)
