@@ -8,7 +8,6 @@ import json
 import math
 import os
 import shutil
-import shutil
 import sys
 import sysconfig
 import uuid
@@ -30,6 +29,9 @@ _DEFAULT_LIMITS = host_limits()
 POLL_SECONDS = _DEFAULT_LIMITS["poll_seconds"]
 SETTLE_SECONDS = _DEFAULT_LIMITS["settle_seconds"]
 SCRATCH_LIMIT = _DEFAULT_LIMITS["scratch_limit_bytes"]
+RETRY_BACKOFF_INITIAL_SECONDS = 30
+RETRY_BACKOFF_MAX_SECONDS = 15 * 60
+FAILURE_LOG_TAIL_BYTES = 8 * 1024
 
 
 def _state(project: Path) -> Path:
@@ -107,6 +109,56 @@ def _disk_usage(path: Path) -> int:
                 except OSError:
                     pass
     return total
+
+
+def _read_file_tail(path: Path, limit: int = FAILURE_LOG_TAIL_BYTES) -> tuple[str, bool]:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return "", False
+        resolved = path.resolve(strict=True)
+        size = resolved.stat().st_size
+        with resolved.open("rb") as stream:
+            stream.seek(max(0, size - limit))
+            content = stream.read(limit)
+        return content.decode("utf-8", errors="replace"), size > limit
+    except OSError:
+        return "", False
+
+
+def _bounded_tail(value: Any, limit: int = FAILURE_LOG_TAIL_BYTES) -> tuple[str, bool]:
+    if not isinstance(value, str):
+        return "", False
+    encoded = value.encode("utf-8", errors="replace")
+    truncated = len(encoded) > limit
+    if truncated:
+        encoded = encoded[-limit:]
+    return encoded.decode("utf-8", errors="replace"), truncated
+
+
+def _compact_scheduler_result(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    compact = dict(value)
+    for stream in ("stdout", "stderr"):
+        text = compact.pop(stream, None)
+        if isinstance(text, str):
+            compact[f"{stream}_bytes"] = len(text.encode("utf-8", errors="replace"))
+    logs = compact.pop("logs", None)
+    if isinstance(logs, dict):
+        compact["logs_summary"] = {key: len(item.encode("utf-8", errors="replace"))
+                                   for key, item in logs.items() if isinstance(item, str)}
+    return compact
+
+
+def _compact_scheduler_job(job: dict[str, Any]) -> dict[str, Any]:
+    compact = dict(job)
+    compact["result"] = _compact_scheduler_result(job.get("result"))
+    attempt = job.get("attempt")
+    if isinstance(attempt, dict):
+        attempt_copy = dict(attempt)
+        attempt_copy["result"] = _compact_scheduler_result(attempt.get("result"))
+        compact["attempt"] = attempt_copy
+    return compact
 
 
 def _build_output_identity(build: Path) -> str | None:
@@ -375,10 +427,28 @@ class Engine:
             missing_configuration.append("readable Scheduler token file (--token-file)")
         if not unit_available:
             missing_configuration.append("preinstalled autobench-coordinator.service user unit")
+        scheduler_access: dict[str, Any] = {"ready": False, "missing_actions": [], "error": None}
+        try:
+            access = await self.scheduler.call("access.inspect", {})
+            actions = access.get("actions", [])
+            actions = [item for item in actions if isinstance(item, str)] if isinstance(actions, list) else []
+            required = ["jobs.submit", "jobs.get", "jobs.list", "jobs.control", "resources.forecast",
+                        "history.compact:autobench"]
+            missing = [needed for needed in required if not any(fnmatch.fnmatchcase(needed, grant) for grant in actions)]
+            principal = access.get("principal_id")
+            principal_valid = isinstance(principal, str) and bool(principal)
+            scheduler_access = {"ready": principal_valid and not missing,
+                                "principal_id": principal, "required_actions": required,
+                                "missing_actions": missing,
+                                "error": None if principal_valid else "access.inspect did not identify the authenticated principal"}
+        except Exception as exc:
+            scheduler_access["error"] = str(exc)
         return {"project": str(self.project), "initialized": self.autobench.exists(),
                 "registry_count": len(benchmarks),
                 "scheduler_configured": bool(self.config.get("scheduler_url") and self.config.get("token_file")),
-                "scheduler_connected": await self._scheduler_health(), "scheduler_principal": self.config.get("principal_id"),
+                "scheduler_connected": scheduler_access["error"] is None,
+                "scheduler_access": scheduler_access,
+                "scheduler_principal": scheduler_access.get("principal_id") or self.config.get("principal_id"),
                 "coordinator_unit_available": unit_available, "missing_profiler_tools": missing_tools,
                 "missing_configuration": missing_configuration,
                 "scheduler_retention_error": self.store.get("scheduler_retention_error"),
@@ -402,6 +472,7 @@ class Engine:
             build_dir = self.autobench / "builds" / build_fp
             if self._build_is_current(build_dir, build_fp):
                 build_output = _build_output_identity(build_dir)
+        build_retry = self._retry_cooldown(name, -1, build_fp) if build_fp else None
         packets = []
         for index, packet in enumerate(benchmark.packets):
             expected = _fingerprint(benchmark, source_fingerprint, packet, manifest, _recipe_hash(packet, autobench_root),
@@ -416,16 +487,104 @@ class Engine:
                 reasons.append("registered build is missing, stale, or incomplete")
             packets.append({"name": packet.name, "kind": packet.kind, "state": "current" if actual == expected and not reasons else "stale_or_missing",
                             "current_fingerprint": actual, "expected_fingerprint": expected, "expected_seconds": packet.expected_seconds,
-                            "kill_seconds": packet.kill_seconds, "depends_on": list(packet.depends_on), "reasons": reasons})
+                            "kill_seconds": packet.kill_seconds, "depends_on": list(packet.depends_on), "reasons": reasons,
+                            "retry_cooldown": self._retry_cooldown(name, index, expected)})
+            retry = packets[-1]["retry_cooldown"]
+            if retry and retry["blocked"]:
+                packets[-1]["reasons"].append(retry["reason"])
         latest = [row for row in self.store.attempts_for(name) if row["state"] in {"submitted", "running", "cleanup_unknown", "submit_intent"}]
         return {"benchmark": name, "source_fingerprint": source_fingerprint, "protocol": benchmark.protocol or {},
                 "build_fingerprint": build_fp, "build_output_identity": build_output, "packets": packets,
+                "build_retry_cooldown": build_retry,
                 "active_or_unresolved_attempts": [{k: row[k] for k in ("id", "packet_index", "job_id", "state", "error")} for row in latest[:16]],
                 "source_trace": self.store.get(f"seen:{name}", {}).get("trace")}
 
+    def _retry_cooldown(self, benchmark: str, packet_index: int, fingerprint: str | None,
+                        now: float | None = None) -> dict[str, Any] | None:
+        """Derive bounded same-input backoff from the retained attempt rows."""
+        if not fingerprint:
+            return None
+        now = time.time() if now is None else now
+        failures = 0
+        newest_failure: dict[str, Any] | None = None
+        success_states = {"succeeded", "build_succeeded"}
+        reset_states = {"prepared", "submit_intent", "submitted", "running", "cleanup_unknown",
+                        "not_submitted", "preempted", "abandoned", "cancelled", "canceled"}
+        for row in self.store.attempts_for(benchmark):
+            if int(row.get("packet_index", -999)) != packet_index:
+                continue
+            if row.get("fingerprint") != fingerprint:
+                # A source, recipe, registration, or build input change clears
+                # this retry streak even if the user later reverts the change.
+                break
+            state = str(row.get("state", "")).casefold()
+            if state in success_states or state in reset_states:
+                break
+            failures += 1
+            if newest_failure is None:
+                newest_failure = row
+        if failures == 0 or newest_failure is None:
+            return None
+        delay = min(RETRY_BACKOFF_INITIAL_SECONDS * (2 ** min(failures - 1, 20)),
+                    RETRY_BACKOFF_MAX_SECONDS)
+        retry_at = float(newest_failure.get("updated", now)) + delay
+        remaining = max(0.0, retry_at - now)
+        last_error = newest_failure.get("error")
+        if not last_error:
+            try:
+                result = json.loads(newest_failure.get("result_json") or "{}")
+                worker = result.get("worker", {}) if isinstance(result, dict) else {}
+                last_error = worker.get("status") if isinstance(worker, dict) else None
+            except (TypeError, json.JSONDecodeError):
+                last_error = None
+        reason = (f"{failures} consecutive failure(s) for this input; retry allowed now" if remaining <= 0 else
+                  f"{failures} consecutive failure(s) for this input; retry in {int(remaining + 0.999)} seconds")
+        return {"fingerprint": fingerprint, "failure_streak": failures, "delay_seconds": delay,
+                "retry_at": retry_at, "remaining_seconds": remaining, "blocked": remaining > 0,
+                "last_error": last_error, "reason": reason}
+
+    @staticmethod
+    def _failure_diagnostics(result: dict[str, Any], staged: Path, job: dict[str, Any]) -> dict[str, Any]:
+        sources: list[dict[str, Any]] = []
+        attempt = job.get("attempt")
+        if isinstance(attempt, dict) and isinstance(attempt.get("result"), dict):
+            sources.append(attempt["result"])
+        if isinstance(job.get("result"), dict):
+            sources.append(job["result"])
+        diagnostics: dict[str, Any] = {}
+        for stream in ("stdout", "stderr"):
+            text, truncated = _read_file_tail(staged / f"{stream}.log")
+            if not text:
+                for source in sources:
+                    logs = source.get("logs") if isinstance(source.get("logs"), dict) else {}
+                    value = source.get(stream, logs.get(stream, logs.get("text", "") if stream == "stdout" else ""))
+                    text, truncated = _bounded_tail(value)
+                    if text:
+                        break
+            if text or truncated:
+                diagnostics[f"{stream}_tail"] = text
+                diagnostics[f"{stream}_truncated"] = truncated
+        if diagnostics:
+            result["diagnostics"] = diagnostics
+        return result
+
+    def retry_cooldowns(self) -> list[dict[str, Any]]:
+        """Return active cooldowns for status without persisting a second index."""
+        active = []
+        for benchmark in load_registry(self.project):
+            explanation = self.explain(benchmark.name)
+            build = explanation.get("build_retry_cooldown")
+            if isinstance(build, dict) and build.get("blocked"):
+                active.append({"benchmark": benchmark.name, "target": "build", **build})
+            for packet in explanation.get("packets", []):
+                retry = packet.get("retry_cooldown")
+                if isinstance(retry, dict) and retry.get("blocked"):
+                    active.append({"benchmark": benchmark.name, "target": packet["name"], **retry})
+        return active
+
     async def _scheduler_health(self) -> bool:
         try:
-            await self.scheduler.call("resources.list", {})
+            await self.scheduler.call("access.inspect", {})
             return True
         except Exception:
             return False
@@ -454,6 +613,7 @@ class Engine:
         benchmarks = load_registry(self.project)
         candidates: list[dict[str, Any]] = []
         storage_blocked: list[str] = []
+        retry_blocked: dict[tuple[str, str], dict[str, Any]] = {}
         for benchmark in benchmarks:
             if not benchmark.enabled:
                 continue
@@ -499,6 +659,10 @@ class Engine:
                 fingerprint = expected_fingerprints[packet.name]
                 if self.store.current(benchmark.name, index) == fingerprint:
                     continue
+                retry = self._retry_cooldown(benchmark.name, index, fingerprint)
+                if retry and retry["blocked"]:
+                    retry_blocked[(benchmark.name, packet.name)] = retry
+                    continue
                 cap_now = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
                 packet_error = self.store.get(f"packet-storage-error:{benchmark.name}:{index}")
                 if (isinstance(packet_error, dict) and packet_error.get("fingerprint") == fingerprint and
@@ -506,6 +670,10 @@ class Engine:
                     storage_blocked.append(packet.name)
                     continue
                 if benchmark.build and not self._build_is_current(build_dir, build_fp or ""):
+                    retry = self._retry_cooldown(benchmark.name, -1, build_fp)
+                    if retry and retry["blocked"]:
+                        retry_blocked[(benchmark.name, "build")] = retry
+                        continue
                     prior_error = self.store.get(f"build-storage-error:{benchmark.name}")
                     if (isinstance(prior_error, dict) and prior_error.get("fingerprint") == build_fp and
                         prior_error.get("cap") == cap_now and prior_error.get("scratch_limit") == self.limits["scratch_limit_bytes"]):
@@ -544,6 +712,10 @@ class Engine:
         if storage_blocked:
             return {"state": "storage_over_cap", "reconciled": reconciled, "submitted": 0,
                     "packets": storage_blocked}
+        if retry_blocked:
+            return {"state": "retry_backoff", "reconciled": reconciled, "submitted": 0,
+                    "cooldowns": [{"benchmark": benchmark, "target": target, **details}
+                                  for (benchmark, target), details in sorted(retry_blocked.items())]}
         return {"state": "idle", "reconciled": reconciled, "submitted": 0}
 
     async def _owner_id(self) -> str:
@@ -810,13 +982,22 @@ class Engine:
                     self.store.set(f"cancel_requested:{attempt['id']}", True)
                 continue
             if not cleanup_verified(job):
-                self.store.set_attempt(attempt["id"], "cleanup_unknown", result={"scheduler_job": dict(job)}, error="terminal scheduler job lacks verified cleanup receipt")
+                self.store.set_attempt(attempt["id"], "cleanup_unknown", result={"scheduler_job": _compact_scheduler_job(dict(job))}, error="terminal scheduler job lacks verified cleanup receipt")
                 continue
             details = self.store.get(f"attempt:{attempt['id']}", {})
             staged = Path(details.get("staged", ""))
             result_path = staged / "result.json"
             result = json.loads(result_path.read_text()) if result_path.exists() else {"status": "missing_result"}
-            success = str(job.get("state", "")).lower() in {"succeeded", "completed"} and result.get("status") == "succeeded"
+            scheduler_state = str(job.get("state", "")).casefold()
+            scheduler_attempt = job.get("attempt") if isinstance(job.get("attempt"), dict) else {}
+            scheduler_attempt_result = scheduler_attempt.get("result") if isinstance(scheduler_attempt.get("result"), dict) else {}
+            preemption = scheduler_attempt.get("preemption") if isinstance(scheduler_attempt.get("preemption"), dict) else {}
+            cancellation_reason = scheduler_attempt_result.get("cancellation_reason", "")
+            blocked_reason = job.get("blocked_reason", "")
+            preempted = (scheduler_state == "preempted" or bool(preemption) or
+                         (isinstance(cancellation_reason, str) and cancellation_reason.startswith("preempted_for:")) or
+                         (isinstance(blocked_reason, str) and blocked_reason.startswith("preempted_for:")))
+            success = scheduler_state in {"succeeded", "completed"} and result.get("status") == "succeeded"
             if success and details.get("kind") != "build":
                 try:
                     _validate_staged_outputs(staged)
@@ -824,18 +1005,27 @@ class Engine:
                     result["status"] = "invalid_output"
                     result["error"] = str(exc)
                     success = False
+            if not success:
+                result = self._failure_diagnostics(result, staged, dict(job))
             if success and details.get("kind") == "build":
                 build = Path(details["build"])
                 build.mkdir(parents=True, exist_ok=True)
                 (build / "SUCCESS.json").write_text(json.dumps({"fingerprint": details["fingerprint"], "attempt": attempt["id"]}), encoding="utf-8")
                 output_identity = _build_output_identity(build)
                 if output_identity is None:
-                    self.store.set_attempt(attempt["id"], "failed", result={"scheduler_job": dict(job), "cleanup_verified": True}, error="successful build produced no files")
+                    failed_result = dict(result)
+                    failed_result["status"] = "build_output_missing"
+                    failed_result["error"] = "successful build produced no files"
+                    failed_result = self._failure_diagnostics(failed_result, staged, dict(job))
+                    self.store.set_attempt(attempt["id"], "failed",
+                                           result={"scheduler_job": _compact_scheduler_job(dict(job)), "worker": failed_result, "cleanup_verified": True},
+                                           error="successful build produced no files")
                     shutil.rmtree(build, ignore_errors=True)
                     shutil.rmtree(staged, ignore_errors=True)
                     Path(details.get("manifest", "")).unlink(missing_ok=True)
                     self.store.delete_setting(f"attempt:{attempt['id']}")
                     self.store.delete_setting(f"reservation:{attempt['id']}")
+                    self.store.compact_history(details["benchmark"], -1, 16)
                     continue
                 (build / "SUCCESS.json").write_text(json.dumps({"fingerprint": details["fingerprint"], "output_identity": output_identity, "benchmark": details["benchmark"], "attempt": attempt["id"]}), encoding="utf-8")
                 self.store.set(f"last-good-build:{details['benchmark']}", str(build))
@@ -844,7 +1034,6 @@ class Engine:
                 benchmark = details["benchmark"]
                 index = int(details["packet_index"])
                 self._publish_result(benchmark, index, details["fingerprint"], attempt["id"], staged, details, job)
-                self.store.compact_history(benchmark, index, 16)
                 self._evict_safe()
                 cap = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
                 if _disk_usage(self.autobench) <= cap:
@@ -853,7 +1042,7 @@ class Engine:
                 else:
                     state = "storage_over_cap"
             else:
-                state = result.get("status", "failed")
+                state = "preempted" if preempted else result.get("status", "failed")
                 if state == "storage_over_cap":
                     failure_record = {
                         "fingerprint": details.get("fingerprint"),
@@ -869,10 +1058,18 @@ class Engine:
                         self.store.set(f"packet-storage-error:{details['benchmark']}:{int(details['packet_index'])}", failure_record)
             device_identity = _device_identity(job)
             protocol_fingerprint = hashlib.sha256(json.dumps(details.get("protocol", {}), sort_keys=True).encode()).hexdigest()
-            self.store.set_attempt(attempt["id"], state, {"job": dict(job), "worker": result,
+            diagnostic_error = None
+            if state not in {"succeeded", "build_succeeded", "preempted"}:
+                diagnostic_error = str(result.get("error") or f"worker result: {result.get('status', state)}")
+                stderr_tail = result.get("diagnostics", {}).get("stderr_tail") if isinstance(result.get("diagnostics"), dict) else None
+                if isinstance(stderr_tail, str) and stderr_tail:
+                    diagnostic_error += ": " + _bounded_tail(stderr_tail, 1024)[0]
+            self.store.set_attempt(attempt["id"], state, {"job": _compact_scheduler_job(dict(job)), "worker": result,
                                                             "identity": {"protocol_fingerprint": protocol_fingerprint,
                                                                          "data_fingerprint": details.get("data_fingerprint"),
-                                                                         "device_identity": device_identity}})
+                                                                         "device_identity": device_identity}},
+                                   error=diagnostic_error)
+            self.store.compact_history(details["benchmark"], int(details.get("packet_index", -1)), 16)
             shutil.rmtree(staged, ignore_errors=True)
             Path(details.get("manifest", "")).unlink(missing_ok=True)
             self._evict_safe()
@@ -883,7 +1080,7 @@ class Engine:
                     shutil.rmtree(build, ignore_errors=True)
                     self.store.set(f"build-storage-error:{details['benchmark']}", {"fingerprint": details["fingerprint"], "cap": cap,
                                                                                      "scratch_limit": self.limits["scratch_limit_bytes"]})
-                    self.store.set_attempt(attempt["id"], "storage_over_cap", result={"scheduler_job": dict(job), "cleanup_verified": True}, error="build exceeded its storage budget")
+                    self.store.set_attempt(attempt["id"], "storage_over_cap", result={"scheduler_job": _compact_scheduler_job(dict(job)), "cleanup_verified": True}, error="build exceeded its storage budget")
                 else:
                     self.store.delete_setting(f"build-storage-error:{details['benchmark']}")
             self.store.delete_setting(f"attempt:{attempt['id']}")

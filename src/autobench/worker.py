@@ -135,7 +135,10 @@ def execute(manifest_path: Path) -> int:
     # Direct output to bounded files, avoiding unbounded in-memory PIPE capture.
     with (result_dir / "stdout.log").open("wb") as stdout, (result_dir / "stderr.log").open("wb") as stderr:
         child_env, ephemeral_paths = _scoped_child_environment(spec, os.environ, result_dir)
-        worker_bin = str(Path(sys.executable).resolve().parent)
+        # Keep the venv's lexical bin path. Resolving this symlink collapses it
+        # to the base interpreter directory and makes child `python3` bypass
+        # the installed Autobench/runtime environment.
+        worker_bin = str(Path(sys.executable).absolute().parent)
         child_env["PATH"] = worker_bin + os.pathsep + child_env.get("PATH", "")
         child_env["AUTOBENCH_SCHEDULER_JOB_ID"] = scheduler_job_id
         child_env["AUTOBENCH_SCHEDULER_ATTEMPT_ID"] = scheduler_attempt_id

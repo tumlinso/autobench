@@ -57,6 +57,13 @@ explicitly in its `environment` table; the requested paths must remain inside
 that attempt's `{output}` directory. Other registered environment values retain
 their configured precedence.
 
+Failed builds and packets retry with per-input cooldowns: 30 seconds initially,
+then exponential backoff capped at 15 minutes. A source, recipe, or registration
+fingerprint change clears the streak; successful work and Scheduler preemption
+also clear it. `autobench explain` reports the packet/build retry window, and
+`autobench status` lists active cooldowns. Cooldown state is derived from the
+bounded attempt history rather than a separate history map.
+
 Import a full TOML definition through the CLI so it receives the same validation
 as the runtime registry:
 

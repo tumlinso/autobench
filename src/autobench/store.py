@@ -109,6 +109,9 @@ class Store:
         return [dict(r) for r in self.db.execute("SELECT * FROM attempts WHERE benchmark=? ORDER BY created DESC LIMIT 100", (benchmark,))]
 
     def compact_history(self, benchmark: str, packet_index: int, keep: int = 16) -> None:
+        count = self.db.execute("SELECT COUNT(*) FROM attempts WHERE benchmark=? AND packet_index=? AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown')", (benchmark, packet_index)).fetchone()[0]
+        if count <= keep:
+            return
         stale = [row[0] for row in self.db.execute("SELECT id FROM attempts WHERE benchmark=? AND packet_index=? AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown') AND id NOT IN (SELECT id FROM attempts WHERE benchmark=? AND packet_index=? ORDER BY created DESC LIMIT ?)", (benchmark, packet_index, benchmark, packet_index, keep))]
         self.db.execute("DELETE FROM attempts WHERE benchmark=? AND packet_index=? AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown') AND id NOT IN (SELECT id FROM attempts WHERE benchmark=? AND packet_index=? ORDER BY created DESC LIMIT ?)", (benchmark, packet_index, benchmark, packet_index, keep))
         self.db.executemany("DELETE FROM settings WHERE key=?", [(f"attempt:{attempt_id}",) for attempt_id in stale])

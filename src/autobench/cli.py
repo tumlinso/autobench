@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -82,16 +83,71 @@ async def _serve_global() -> None:
         await asyncio.sleep(5)
 
 
-def _cmd_init(args: argparse.Namespace) -> int:
+def _set_project_active(project: Path, active: bool) -> None:
+    autobench = project / ".autobench"
+    config_path = autobench / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["active"] = active
+    temporary = config_path.with_name(config_path.name + ".tmp")
+    temporary.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(config_path)
+    if active:
+        enrolled = autobench / "enrolled.json"
+        temporary_enrolled = enrolled.with_name(enrolled.name + ".tmp")
+        temporary_enrolled.write_text(json.dumps({"active": True, "project": str(project), "activated_at": time.time()}, indent=2) + "\n", encoding="utf-8")
+        temporary_enrolled.replace(enrolled)
+    else:
+        (autobench / "enrolled.json").unlink(missing_ok=True)
+    catalog = Catalog(create=False)
+    try:
+        catalog.enroll(project, active=active)
+    finally:
+        catalog.close()
+
+
+async def _cmd_init(args: argparse.Namespace) -> int:
     project = _project(args.project)
     result = init_project(project, scheduler_url=args.scheduler_url, token_file=args.token_file,
                           retained_cap_bytes=int(args.retained_cap_gib * 1024**3),
-                          agent_instructions=args.agent_instructions, activate=args.activate)
-    ready = result["scheduler_configured"]
-    activated, activation_message = (activate_existing_user_unit() if args.activate and ready else
-                                     (False, "Scheduler is not configured; activation was skipped" if args.activate else "activation was skipped"))
+                          agent_instructions=args.agent_instructions, activate=False)
+    access_report: dict[str, Any] = {"ready": False, "missing_actions": [], "error": None}
+    if result["scheduler_configured"]:
+        try:
+            engine = _engine(project, require_scheduler=True)
+            try:
+                doctor = await engine.doctor()
+                access_report = doctor["scheduler_access"]
+            finally:
+                engine.close()
+        except Exception as exc:
+            access_report["error"] = str(exc)
+    scheduler_ready = bool(access_report.get("ready"))
+    if scheduler_ready and args.activate:
+        _set_project_active(project, True)
+        activated, activation_message = activate_existing_user_unit()
+    else:
+        _set_project_active(project, False)
+        activated = False
+        if not result["scheduler_configured"]:
+            activation_message = "Scheduler URL and readable token are required; activation was skipped"
+        elif not scheduler_ready:
+            missing = access_report.get("missing_actions", [])
+            if missing:
+                activation_message = "Scheduler principal is missing required grants: " + ", ".join(missing)
+            else:
+                activation_message = "Scheduler access probe failed: " + str(access_report.get("error") or "unknown error")
+        else:
+            activation_message = "activation was skipped"
+    if not scheduler_ready:
+        readiness = "incomplete: Scheduler access must succeed and include the required owner-scoped grants"
+    elif not args.activate:
+        readiness = "configured: Scheduler grants verified; activation skipped"
+    elif activated:
+        readiness = "ready"
+    else:
+        readiness = "incomplete: Scheduler grants are valid, but the preinstalled Autobench coordinator service did not start"
     result.update({"initialized": True, "service_activated": activated, "activation": activation_message,
-                   "readiness": "ready" if ready and activated else "incomplete: configure Scheduler credentials and install/configure the Autobench coordinator user service; initialization does not install host services"})
+                   "scheduler_access": access_report, "readiness": readiness})
     print(json.dumps(result, indent=2))
     return 0
 
@@ -130,6 +186,7 @@ async def _async_action(args: argparse.Namespace) -> int:
         elif args.command == "status":
             result = engine.store.status()
             result["registrations"] = [b.name for b in load_registry(project)]
+            result["retry_cooldowns"] = engine.retry_cooldowns()
         elif args.command == "results":
             names = [b.name for b in load_registry(project)] if args.name == "all" else [args.name]
             result = {name: engine.store.attempts_for(name) for name in names}
@@ -266,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         args.argv = packet_argv
     try:
         if args.command == "init":
-            return _cmd_init(args)
+            return asyncio.run(_cmd_init(args))
         if args.command == "register":
             if args.file and args.argv:
                 parser.error("--file registration does not accept trailing argv")

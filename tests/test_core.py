@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import venv
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -259,6 +260,39 @@ class AutobenchCoreTests(unittest.TestCase):
                 self.assertTrue(Path(path).is_relative_to(staged))
                 self.assertFalse(Path(path).exists(), path)
 
+    def test_worker_child_python_uses_symlink_venv_and_its_site_packages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            venv_root = root / "runtime-venv"
+            venv.EnvBuilder(with_pip=False, symlinks=True).create(venv_root)
+            child_python = venv_root / "bin/python3"
+            self.assertTrue(child_python.is_symlink())
+            py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            site_packages = venv_root / "lib" / py_version / "site-packages"
+            site_packages.mkdir(parents=True, exist_ok=True)
+            (site_packages / "autobench_venv_probe.py").write_text("VALUE = 'venv-site-package'\n")
+
+            (root / "src").mkdir()
+            staged = root / ".autobench/scratch/attempt-venv"
+            staged.mkdir(parents=True)
+            observed = staged / "import-result.txt"
+            code = "import autobench_venv_probe,pathlib; pathlib.Path(%r).write_text(autobench_venv_probe.VALUE)" % str(observed)
+            manifest = root / "packet.json"
+            manifest.write_text(json.dumps({
+                "argv": ["python3", "-c", code], "working_directory": str(root / "src"),
+                "allowed_root": str(root), "managed_root": str(root / ".autobench"),
+                "result_directory": str(staged), "scratch_limit_bytes": 1024 * 1024,
+                "retained_cap_bytes": 8 * 1024 * 1024, "output_limit_bytes": 1024 * 1024,
+                "kill_seconds": 5, "environment": {"PATH": "/usr/bin:/bin", "PYTHONPATH": ""},
+            }))
+            with patch("autobench.worker.sys.executable", str(child_python)), \
+                 patch.dict(os.environ, {"DEVICE_SCHEDULER_JOB_ID": "job-test",
+                                         "DEVICE_SCHEDULER_ATTEMPT_ID": "attempt-test"}):
+                self.assertEqual(execute(manifest), 0)
+            self.assertEqual(observed.read_text(), "venv-site-package")
+            result = json.loads((staged / "result.json").read_text())
+            self.assertEqual(result["status"], "succeeded")
+
     def test_public_api_initializes_enrolls_and_registers_without_cli_duplication(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
             "XDG_STATE_HOME": str(Path(temp) / "state-home"),
@@ -279,6 +313,61 @@ class AutobenchCoreTests(unittest.TestCase):
             registration = register_benchmark(project, "api", include=["src/**"], argv=["python3", "-c", "pass"], expected_seconds=1, kill_seconds=2)
             self.assertTrue(registration.exists())
             self.assertEqual(load_registry(project)[0].name, "api")
+
+    def test_cli_init_does_not_activate_when_scheduler_grants_are_missing_or_unreachable(self):
+        import io
+        from contextlib import redirect_stdout
+
+        class ProbeClient:
+            def __init__(self, response=None, error=None):
+                self.response = response
+                self.error = error
+
+            async def call(self, operation, arguments=None):
+                if operation != "access.inspect":
+                    raise AssertionError(operation)
+                if self.error:
+                    raise RuntimeError(self.error)
+                return self.response
+
+        required = {"jobs.submit", "jobs.get", "jobs.list", "jobs.control", "resources.forecast",
+                    "history.compact:autobench"}
+        for case, response, error in (
+            ("denied", {"principal_id": "agent:test", "actions": []}, None),
+            ("unreachable", None, "connection refused"),
+            ("allowed", {"principal_id": "agent:test", "actions": sorted(required)}, None),
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+                "XDG_STATE_HOME": str(Path(temp) / "state-home"),
+                "XDG_CONFIG_HOME": str(Path(temp) / "config-home"),
+            }):
+                project = Path(temp) / "project"
+                project.mkdir()
+                token = project / "scheduler.token"
+                token.write_text("test-token")
+                stdout = io.StringIO()
+                with patch("autobench.cli.McpScheduler", return_value=ProbeClient(response, error)), \
+                     patch("autobench.cli.activate_existing_user_unit", return_value=(True, "started")) as activate, \
+                     redirect_stdout(stdout):
+                    code = cli_main(["init", "--project", str(project), "--scheduler-url", "http://scheduler",
+                                     "--token-file", str(token), "--agent-instructions=skip"])
+                result = json.loads(stdout.getvalue())
+                self.assertEqual(code, 0)
+                self.assertTrue(result["initialized"])
+                if case == "allowed":
+                    self.assertEqual(result["readiness"], "ready")
+                    self.assertTrue(result["service_activated"])
+                    self.assertTrue(json.loads((project / ".autobench/config.json").read_text())["active"])
+                    activate.assert_called_once()
+                else:
+                    self.assertTrue(result["readiness"].startswith("incomplete:"))
+                    self.assertFalse(result["service_activated"])
+                    self.assertFalse(json.loads((project / ".autobench/config.json").read_text())["active"])
+                    activate.assert_not_called()
+                if case == "denied":
+                    self.assertEqual(set(result["scheduler_access"]["missing_actions"]), required)
+                elif case == "unreachable":
+                    self.assertIn("connection refused", result["scheduler_access"]["error"])
 
     def test_init_preserves_existing_autobench_gitignore(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
@@ -345,6 +434,72 @@ class AutobenchCoreTests(unittest.TestCase):
                 explanation = engine.explain("demo")
                 self.assertEqual(explanation["packets"][0]["state"], "stale_or_missing")
                 self.assertIn("changed", explanation["packets"][0]["reasons"][0])
+            finally:
+                engine.close()
+
+    def test_failed_packet_keeps_only_bounded_log_tails_after_scratch_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value=1\n")
+            autobench = project / ".autobench"
+            (autobench / "registry").mkdir(parents=True)
+            (autobench / "config.json").write_text("{}")
+            (autobench / "registry/demo.toml").write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1}
+''')
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            engine = Engine(project, scheduler)
+            try:
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "submitted")
+                attempt = engine.store.unresolved()[0]
+                details = engine.store.get(f"attempt:{attempt['id']}")
+                staged = Path(details["staged"])
+                staged.mkdir(parents=True, exist_ok=True)
+                (staged / "result.json").write_text(json.dumps({"status": "failed", "returncode": 1}))
+                (staged / "stdout.log").write_bytes(b"out-start" + b"o" * 12_000 + b"out-tail")
+                (staged / "stderr.log").write_bytes(b"err-start" + b"e" * 20_000 + b"fixture-diagnostic-tail")
+                scheduler.job = {"id": "job-1", "state": "failed", "cleanup_verified": True,
+                                 "attempt": {"result": {"stdout": "s" * 20_000,
+                                                         "logs": {"stderr": "t" * 30_000}}}}
+                self.assertEqual(asyncio.run(engine._reconcile_jobs()), 1)
+                self.assertFalse(staged.exists())
+                row = next(item for item in engine.store.attempts_for("demo") if item["id"] == attempt["id"])
+                report = json.loads(row["result_json"])
+                diagnostics = report["worker"]["diagnostics"]
+                self.assertTrue(diagnostics["stdout_truncated"])
+                self.assertTrue(diagnostics["stderr_truncated"])
+                self.assertLessEqual(len(diagnostics["stdout_tail"].encode()), 8 * 1024)
+                self.assertLessEqual(len(diagnostics["stderr_tail"].encode()), 8 * 1024)
+                self.assertTrue(diagnostics["stderr_tail"].endswith("fixture-diagnostic-tail"))
+                self.assertIn("fixture-diagnostic-tail", row["error"])
+                scheduler_result = report["job"]["attempt"]["result"]
+                self.assertNotIn("stdout", scheduler_result)
+                self.assertNotIn("logs", scheduler_result)
+                self.assertEqual(scheduler_result["stdout_bytes"], 20_000)
+                self.assertEqual(scheduler_result["logs_summary"]["stderr"], 30_000)
+
+                fallback = Engine._failure_diagnostics(
+                    {"status": "missing_result"}, staged,
+                    {"attempt": {"result": {"logs": {"stdout": "scheduler-out", "stderr": "s" * 20_000 + "scheduler-stderr"}}}},
+                )
+                self.assertTrue(fallback["diagnostics"]["stderr_truncated"])
+                self.assertLessEqual(len(fallback["diagnostics"]["stderr_tail"].encode()), 8 * 1024)
+                self.assertTrue(fallback["diagnostics"]["stderr_tail"].endswith("scheduler-stderr"))
             finally:
                 engine.close()
 
@@ -824,6 +979,124 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
                     asyncio.run(engine._submit(benchmark, project, project / ".autobench/builds/x", packet, 0,
                                                "fp", "timeline-profile", identity=chosen["identity"]))
                 self.assertFalse(any(operation == "jobs.submit" for operation, _args in scheduler.calls))
+            finally:
+                engine.close()
+
+    def test_failure_backoff_blocks_same_packet_fingerprint_and_input_change_resets_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value = 1\n")
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            (project / ".autobench/registry/demo.toml").write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1}
+''')
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            engine = Engine(project, scheduler)
+            try:
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                expected = engine.explain("demo")["packets"][0]["expected_fingerprint"]
+                failed = engine.store.begin_attempt("demo", 1, 0, expected)
+                engine.store.set_attempt(failed, "missing_result", result={"worker": {"status": "missing_result"}},
+                                         error="worker result missing")
+
+                result = asyncio.run(engine.reconcile_once())
+                self.assertEqual(result["state"], "retry_backoff")
+                self.assertFalse(any(op == "jobs.submit" for op, _ in scheduler.calls))
+                retry = engine.explain("demo")["packets"][0]["retry_cooldown"]
+                self.assertTrue(retry["blocked"])
+                self.assertEqual(retry["failure_streak"], 1)
+                self.assertIn("retry in", retry["reason"])
+                self.assertEqual(engine.retry_cooldowns()[0]["target"], "run")
+
+                (project / "src/input.py").write_text("value = 2\n")
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                changed = asyncio.run(engine.reconcile_once())
+                self.assertEqual(changed["state"], "submitted", changed)
+                self.assertEqual(sum(op == "jobs.submit" for op, _ in scheduler.calls), 1)
+            finally:
+                engine.close()
+
+    def test_backoff_resets_after_success_and_scheduler_preemption_for_build_and_packet(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            create_test_store(project).close()
+            engine = Engine(project, FakeScheduler())
+            try:
+                for packet_index in (-1, 0):
+                    failure = engine.store.begin_attempt("demo", 1, packet_index, f"fp-{packet_index}")
+                    engine.store.set_attempt(failure, "failed", error="runner failed")
+                    cooldown = engine._retry_cooldown("demo", packet_index, f"fp-{packet_index}")
+                    self.assertTrue(cooldown["blocked"])
+                    self.assertEqual(cooldown["failure_streak"], 1)
+
+                    engine.store.set_attempt(failure, "succeeded", result={"worker": {"status": "succeeded"}})
+                    self.assertIsNone(engine._retry_cooldown("demo", packet_index, f"fp-{packet_index}"))
+
+                    engine.store.set_attempt(failure, "failed", error="runner failed")
+                    preempted = engine.store.begin_attempt("demo", 1, packet_index, f"fp-{packet_index}")
+                    engine.store.set_attempt(preempted, "preempted", result={"worker": {"status": "missing_result"}})
+                    self.assertIsNone(engine._retry_cooldown("demo", packet_index, f"fp-{packet_index}"))
+            finally:
+                engine.close()
+
+    def test_failed_build_fingerprint_is_cooled_down_before_resubmission(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project = Path(temp)
+            (project / "src").mkdir()
+            (project / "src/input.py").write_text("value = 1\n")
+            (project / ".autobench/registry").mkdir(parents=True)
+            (project / ".autobench/config.json").write_text("{}")
+            (project / ".autobench/registry/demo.toml").write_text('''[benchmark]
+name="demo"
+revision=1
+[source]
+include=["src/**"]
+[build]
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+resources={cpu_cores=1}
+[[packet]]
+name="run"
+argv=["/usr/bin/true"]
+expected_seconds=2
+kill_seconds=30
+''')
+            create_test_store(project).close()
+            scheduler = FakeScheduler()
+            engine = Engine(project, scheduler)
+            try:
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                build_fp = engine.explain("demo")["build_fingerprint"]
+                failed = engine.store.begin_attempt("demo", 1, -1, build_fp)
+                engine.store.set_attempt(failed, "missing_result", error="build produced no result")
+                result = asyncio.run(engine.reconcile_once())
+                self.assertEqual(result["state"], "retry_backoff")
+                self.assertEqual(result["cooldowns"][0]["target"], "build")
+                self.assertFalse(any(op == "jobs.submit" for op, _ in scheduler.calls))
             finally:
                 engine.close()
 
