@@ -926,6 +926,7 @@ class Engine:
             "timeout_seconds": command.kill_seconds + 10,
             "expected_duration_seconds": self._expected_duration(benchmark, index, command, identity or {}),
             "kill_timeout_seconds": command.kill_seconds,
+            "termination_grace_seconds": 5,
             "preemption_action": "abandon",
             "max_attempts": 1,
             "idempotency_key": job_idempotency,

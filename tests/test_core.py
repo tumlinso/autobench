@@ -486,6 +486,7 @@ resources={cpu_cores=1}
                 self.assertTrue(scheduler.job_spec["flexible"])
                 self.assertEqual(scheduler.job_spec["expected_duration_seconds"], 5)
                 self.assertEqual(scheduler.job_spec["kill_timeout_seconds"], 30)
+                self.assertEqual(scheduler.job_spec["termination_grace_seconds"], 5)
                 self.assertEqual(scheduler.job_spec["owner_id"], "agent-principal")
                 self.assertEqual(scheduler.job_spec["argv"][1:3], ["-m", "autobench.worker"])
                 key_version, key_expiry, key_unique = scheduler.job_spec["idempotency_key"].split(":", 2)
