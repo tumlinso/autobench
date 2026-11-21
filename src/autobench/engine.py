@@ -19,6 +19,7 @@ from typing import Any
 from .errors import AutobenchError, SchedulerUnavailable
 from .models import Benchmark, Command
 from .registry import load_registry
+from .run import advance_runs, run_evidence
 from .scheduler import Scheduler, cleanup_verified, job_object, terminal
 from .snapshot import capture, observe
 from .source_trace import SourceTrace
@@ -110,6 +111,23 @@ def _recipe_hash(command: Command, autobench_root: Path) -> str:
         rel = path.relative_to(autobench_root).as_posix()
         digest.update(rel.encode() + b"\0" + path.read_bytes())
     return digest.hexdigest()
+
+
+def _build_fingerprint(benchmark: Benchmark, source: str, recipe_root: Path,
+                       *, recipe_hash: str | None = None) -> str | None:
+    command = benchmark.build
+    if command is None:
+        return None
+    if recipe_hash is None:
+        recipe_hash = _recipe_hash(command, recipe_root)
+    payload = {"source": source, "argv": command.argv, "resources": command.resources,
+               "expected": command.expected_seconds, "kill": command.kill_seconds, "recipe": recipe_hash}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _data_manifest(benchmark: Benchmark, manifest: dict[str, str]) -> dict[str, str]:
+    return {p: digest for p, digest in manifest.items()
+            if any(fnmatch.fnmatchcase(p, pat) or Path(p).match(pat) for pat in benchmark.data)}
 
 
 def _substitute(command: Command, snapshot: Path, build: Path, output: Path, project: Path, artifacts: dict[str, Path], autobench_root: Path) -> tuple[list[str], dict[str, str]]:
@@ -266,6 +284,12 @@ def _validate_staged_outputs(directory: Path) -> None:
                 path.resolve().relative_to(root)
             except ValueError as exc:
                 raise AutobenchError(f"staged output escapes its result directory: {path}") from exc
+    metrics = directory / "metrics.json"
+    if metrics.exists():
+        try:
+            json.loads(metrics.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise AutobenchError("Worker metrics.json is unreadable or malformed") from exc
 
 
 def _timestamp(value: Any) -> float:
@@ -279,21 +303,15 @@ def _timestamp(value: Any) -> float:
     return float("inf")
 
 
-def _scheduler_resources(raw: dict[str, Any], selected_resource_ids: list[str] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
-    """Translate the compact registration envelope to Scheduler requirements."""
+def _scheduler_resources(raw: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Translate declared requirements. Placement remains Scheduler's decision."""
     explicit = raw.get("scheduler")
     tags = [str(tag) for tag in raw.get("tags", [])] if isinstance(raw.get("tags", []), list) else []
     if explicit is not None:
-        if not isinstance(explicit, list):
+        if not isinstance(explicit, list) or not all(isinstance(item, dict) for item in explicit):
             raise AutobenchError("resources.scheduler must be an array of Scheduler resource requirements")
         requirements = [dict(item) for item in explicit]
-        gpu_indices = [i for i, item in enumerate(requirements) if isinstance(item, dict) and str(item.get("kind", "")).casefold() == "gpu"]
-        if selected_resource_ids is not None and gpu_indices:
-            if len(selected_resource_ids) != len(gpu_indices):
-                raise AutobenchError("Scheduler forecast GPU IDs do not match the registered GPU requirement count")
-            for index, resource_id in zip(gpu_indices, selected_resource_ids):
-                requirements[index]["selectors"] = {**requirements[index].get("selectors", {}), "resource_id": resource_id}
-        if gpu_indices and "gpu.exclusive" not in tags:
+        if any(str(item.get("kind", "")).casefold() == "gpu" for item in requirements) and "gpu.exclusive" not in tags:
             tags.append("gpu.exclusive")
         return requirements, tags
     requirements: list[dict[str, Any]] = []
@@ -305,21 +323,73 @@ def _scheduler_resources(raw: dict[str, Any], selected_resource_ids: list[str] |
         count = raw.get("gpu_count", 1)
         if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count > 16:
             raise AutobenchError("resources.gpu_count must be an integer from 1 to 16")
-        if selected_resource_ids is not None and len(selected_resource_ids) != count:
-            raise AutobenchError("Scheduler forecast GPU IDs do not match resources.gpu_count")
         topology = raw.get("topology_constraints", {})
         if not isinstance(topology, dict):
             raise AutobenchError("resources.topology_constraints must be a Scheduler topology constraint table")
-        for index in range(count):
-            requirement = {"kind": "gpu", "quantities": {"memory_bytes": raw["gpu_memory_bytes"]},
-                           "mode": raw.get("mode", "exclusive"), "same_host": True,
-                           "topology_constraints": topology}
-            if selected_resource_ids is not None:
-                requirement["selectors"] = {"resource_id": selected_resource_ids[index]}
-            requirements.append(requirement)
+        for _ in range(count):
+            requirements.append({"kind": "gpu", "quantities": {"memory_bytes": raw["gpu_memory_bytes"]},
+                                 "mode": raw.get("mode", "exclusive"), "same_host": True,
+                                 "topology_constraints": topology})
         if "gpu.exclusive" not in tags:
             tags.append("gpu.exclusive")
     return requirements, tags
+
+
+def _job_progress(job: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    state = str(job.get("state", "")).casefold()
+    blocked = job.get("blocked_reason")
+    report = {"job": {"state": state, "blocked_reason": blocked}}
+    if state in {"running", "active"}:
+        return "running", {**report, "phase": "running"}
+    if state in {"unknown", "cleanup_unknown", "reclaiming"}:
+        return "cleanup_unknown", {**report, "phase": "cleanup",
+                                   "reason_code": "cleanup_unverified",
+                                   "reason": blocked or "Scheduler reports an unresolved execution or cleanup"}
+    phase = "admission" if state in {"starting", "admitting"} else "queued"
+    if blocked:
+        report.update(reason_code=blocked, reason=blocked)
+    return "submitted", {**report, "phase": phase}
+
+
+def _job_failure(job: dict[str, Any], result: dict[str, Any], preempted: bool) -> tuple[str, str, str]:
+    """Prefer Scheduler's execution outcome when the worker could not report."""
+    scheduler_state = str(job.get("state", "")).casefold()
+    attempt = job.get("attempt")
+    receipts = tuple(item for item in (job.get("result"), attempt.get("result") if isinstance(attempt, dict) else None)
+                     if isinstance(item, dict))
+    reasons = [item.get("reason") for item in receipts]
+    statuses = [item.get("result") for item in receipts]
+    worker_state = result.get("status", "missing_result")
+    if preempted:
+        return "preempted", "preempted", "Scheduler preempted this packet"
+    if "deadline_expired" in reasons:
+        return "admission_timeout", "deadline_expired", "Scheduler admission deadline expired before launch"
+    if "execution_precondition_unverified" in reasons:
+        receipt = next((item.get("precondition_receipt") for item in receipts if item.get("precondition_receipt")), {})
+        failures = receipt.get("preconditions", []) if isinstance(receipt, dict) else []
+        failure = next((item for item in failures if isinstance(item, dict) and item.get("state") != "verified"), {})
+        failed_reports = failure.get("reports", [])
+        failed_report = next((item for item in failed_reports if isinstance(item, dict)
+                              and item.get("state") != "verified"), {})
+        details = failed_report.get("evidence") or failure.get("evidence") or {}
+        observation = details.get("observation") or {}
+        why = (observation.get("reason") or failed_report.get("reason") or failure.get("reason") or
+               failure.get("state"))
+        reason = f"Scheduler could not verify {failure.get('name') or 'the prelaunch requirements'}"
+        return "admission_failed", "execution_precondition_unverified", f"{reason} ({why})" if why else reason
+    if worker_state == "timed_out" or scheduler_state == "timed_out" or "timeout" in statuses:
+        return "timed_out", "runtime_timeout", "The packet reached its runtime limit"
+    if worker_state == "storage_over_cap":
+        return "storage_over_cap", "storage_over_cap", "The packet exceeded its storage budget"
+    if scheduler_state in {"cancelled", "canceled", "abandoned"}:
+        return "cancelled", "cancelled", "Scheduler cancelled this packet"
+    if worker_state not in {"missing_result", "succeeded"}:
+        code = "worker_failed" if worker_state == "failed" else worker_state
+        return worker_state, code, str(result.get("error") or f"Worker result was {worker_state}")
+    if scheduler_state in {"succeeded", "completed"}:
+        return "missing_result", "missing_worker_result", "Scheduler completed but the worker result is missing"
+    reason = next((value for value in reasons if isinstance(value, str) and value), "scheduler_failed")
+    return "failed", reason, f"Scheduler did not complete the packet ({reason})"
 
 
 class Engine:
@@ -341,9 +411,9 @@ class Engine:
         self.store.close()
 
     @contextmanager
-    def _workspace_writer_lock(self):
+    def _workspace_writer_lock(self, lock_name: str = "coordinator.lock"):
         """A fresh open-file-description lock shared by all coordinators/processes."""
-        lock_path = self.state / "coordinator.lock"
+        lock_path = self.state / lock_name
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(lock_path, flags, 0o600)
         acquired = False
@@ -537,7 +607,7 @@ class Engine:
         newest_failure: dict[str, Any] | None = None
         success_states = {"succeeded", "build_succeeded"}
         reset_states = {"prepared", "submit_intent", "submitted", "running", "cleanup_unknown",
-                        "not_submitted", "preempted", "abandoned", "cancelled", "canceled"}
+                        "preempted", "abandoned", "cancelled", "canceled"}
         for row in self.store.attempts_for(benchmark):
             if int(row.get("packet_index", -999)) != packet_index:
                 continue
@@ -617,7 +687,7 @@ class Engine:
         except Exception:
             return False
 
-    async def reconcile_once(self) -> dict[str, Any]:
+    async def reconcile_once(self, *, explicit_only: bool = False) -> dict[str, Any]:
         # Hold a nonblocking interprocess lock across all reads, Scheduler awaits,
         # submit intent, and evidence import. A busy second coordinator does no work.
         with self._workspace_writer_lock() as acquired:
@@ -627,18 +697,26 @@ class Engine:
             if failures:
                 return {"state": "waiting_for_prepared_cleanup", "recovered": recovered,
                         "failures": failures, "submitted": 0}
-            return await self._reconcile_once_locked()
+            return await self._reconcile_once_locked(explicit_only=explicit_only)
 
-    async def _reconcile_once_locked(self) -> dict[str, Any]:
-        if self.store.get("paused", False):
-            return {"state": "paused", "submitted": 0}
-        reconciled = await self._reconcile_jobs()
-        await self._compact_scheduler_history_if_due()
-        # Fail closed on unresolved execution/cleanup: no duplicate submission.
+    async def _reconcile_once_locked(self, *, explicit_only: bool = False) -> dict[str, Any]:
+        paused = bool(self.store.get("paused", False))
+        reconciled = await self._reconcile_jobs(replay=not paused)
+        run_progress = await advance_runs(self, allow_submit=not paused)
+        for run_id in self.store.compact_runs():
+            shutil.rmtree(run_evidence(self, run_id), ignore_errors=True)
+        if run_progress is not None:
+            return {**run_progress, "reconciled": reconciled}
+        if paused:
+            return {"state": "paused", "reconciled": reconciled, "submitted": 0}
+        if explicit_only:
+            return {"state": "idle", "reconciled": reconciled, "submitted": 0}
         unresolved = self.store.unresolved()
-        if unresolved:
-            return {"state": "waiting_for_scheduler_cleanup", "reconciled": reconciled, "submitted": 0}
+        in_flight = {(row["benchmark"], row["packet_index"], row["fingerprint"]) for row in unresolved}
+        active_builds = {row["fingerprint"] for row in unresolved if row["packet_index"] == -1}
         benchmarks = load_registry(self.project)
+        if benchmarks and not unresolved and not self.store.active_runs():
+            await self._compact_scheduler_history_if_due()
         candidates: list[dict[str, Any]] = []
         storage_blocked: list[str] = []
         retry_blocked: dict[tuple[str, str], dict[str, Any]] = {}
@@ -666,10 +744,7 @@ class Engine:
                 continue
             packet_index_by_name = {packet.name: i for i, packet in enumerate(benchmark.packets)}
             autobench_root = _autobench_root(self.config)
-            build_fp = hashlib.sha256(json.dumps({"source": source.fingerprint, "argv": benchmark.build.argv,
-                                                   "resources": benchmark.build.resources, "expected": benchmark.build.expected_seconds,
-                                                   "kill": benchmark.build.kill_seconds,
-                                                   "recipe": _recipe_hash(benchmark.build, autobench_root)}, sort_keys=True, default=str).encode()).hexdigest() if benchmark.build else None
+            build_fp = _build_fingerprint(benchmark, source.fingerprint, autobench_root)
             build_dir = self.autobench / "builds" / (build_fp or "no-build")
             build_output_identity = _build_output_identity(build_dir) if benchmark.build and self._build_is_current(build_dir, build_fp or "") else None
             expected_fingerprints = {packet.name: _fingerprint(
@@ -685,7 +760,7 @@ class Engine:
                     dep_index = packet_index_by_name[dep]
                     artifacts[dep] = self._current_artifact(benchmark.name, dep_index)
                 fingerprint = expected_fingerprints[packet.name]
-                if self.store.current(benchmark.name, index) == fingerprint:
+                if self.store.current(benchmark.name, index) == fingerprint or (benchmark.name, index, fingerprint) in in_flight:
                     continue
                 retry = self._retry_cooldown(benchmark.name, index, fingerprint)
                 if retry and retry["blocked"]:
@@ -698,6 +773,8 @@ class Engine:
                     storage_blocked.append(packet.name)
                     continue
                 if benchmark.build and not self._build_is_current(build_dir, build_fp or ""):
+                    if build_fp in active_builds:
+                        continue
                     retry = self._retry_cooldown(benchmark.name, -1, build_fp)
                     if retry and retry["blocked"]:
                         retry_blocked[(benchmark.name, "build")] = retry
@@ -719,7 +796,7 @@ class Engine:
                                                  "source_fingerprint": source.fingerprint,
                                                  "build_fingerprint": build_fp})
                     return {"state": "submitted", "reconciled": reconciled, "benchmark": benchmark.name, "kind": "build", "submitted": 1}
-                data_manifest = {p: source.manifest[p] for p in source.manifest if any(fnmatch.fnmatchcase(p, pat) or Path(p).match(pat) for pat in benchmark.data)}
+                data_manifest = _data_manifest(benchmark, source.manifest)
                 recipe_fingerprint = _recipe_hash(packet, autobench_root)
                 protocol = _measurement_protocol(benchmark, packet, recipe_fingerprint)
                 candidates.append({"benchmark": benchmark, "snapshot": source.directory, "build": build_dir,
@@ -754,7 +831,8 @@ class Engine:
             return {"state": "retry_backoff", "reconciled": reconciled, "submitted": 0,
                     "cooldowns": [{"benchmark": benchmark, "target": target, **details}
                                   for (benchmark, target), details in sorted(retry_blocked.items())]}
-        return {"state": "idle", "reconciled": reconciled, "submitted": 0}
+        return {"state": "waiting_for_scheduler_cleanup" if unresolved else "idle",
+                "reconciled": reconciled, "submitted": 0}
 
     async def _owner_id(self) -> str:
         owner = self.config.get("principal_id")
@@ -813,7 +891,10 @@ class Engine:
                         forecast_cache[cache_key] = forecast
                     options = [item for item in forecast.get("candidates", [])
                                if isinstance(item, dict) and item.get("feasible_now") is True]
-                    if options:
+                    inventory = forecast.get("inventory", {})
+                    if has_gpu and isinstance(inventory, dict) and inventory.get("stale") is True:
+                        wait_reason = "inventory_stale"
+                    elif options:
                         best = min(options, key=lambda item: _timestamp(item.get("earliest_start")))
                         ids = best.get("resource_ids", [])
                         current_resources = forecast.get("current_resources", [])
@@ -847,6 +928,8 @@ class Engine:
                 except Exception as exc:
                     forecast = {"available": False, "reason": str(exc)}
                     wait_reason = "forecast_unavailable"
+            # These IDs inform ranking and estimates. The submitted selectors
+            # come only from the registration.
             candidate["identity"]["selected_resource_ids"] = selected_resource_ids
             candidate["identity"]["availability_forecast"] = forecast
             candidate["identity"]["forecast_ready"] = forecast_ready
@@ -859,9 +942,12 @@ class Engine:
         return min(scored, key=lambda entry: entry[0])[1]
 
     async def _compact_scheduler_history_if_due(self) -> None:
+        now = time.time()
         last = float(self.store.get("last_scheduler_compact", 0))
-        if time.time() - last < 24 * 60 * 60:
+        last_attempt = float(self.store.get("last_scheduler_compact_attempt", 0))
+        if now - last < 24 * 60 * 60 or now - last_attempt < 15 * 60:
             return
+        self.store.set("last_scheduler_compact_attempt", now)
         before = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         try:
             await self.scheduler.call("history.compact", {"before": before, "max_records": 1000})
@@ -905,17 +991,22 @@ class Engine:
         grace = min(5, command.kill_seconds - command.expected_seconds)
         return min(float(command.kill_seconds - grace), estimate)
 
-    async def _submit(self, benchmark: Benchmark, snapshot: Path, build: Path, command: Command, index: int, fingerprint: str, kind: str, artifacts: dict[str, Path] | None = None, identity: dict[str, Any] | None = None) -> None:
+    async def _submit(self, benchmark: Benchmark, snapshot: Path, build: Path, command: Command, index: int, fingerprint: str, kind: str, artifacts: dict[str, Path] | None = None, identity: dict[str, Any] | None = None) -> str:
         cap = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
         reservation = int(self.limits["scratch_limit_bytes"])
         current_usage = _disk_usage(self.autobench)
-        outstanding = self._reserved_bytes(current_usage)
+        outstanding = self._reserved_bytes()
         if _disk_usage(self.autobench) + outstanding + reservation > cap:
             self._evict_safe(required_free=outstanding + reservation)
             current_usage = _disk_usage(self.autobench)
-            outstanding = self._reserved_bytes(current_usage)
+            outstanding = self._reserved_bytes()
         if current_usage + outstanding + reservation > cap:
             raise AutobenchError("retained-data cap reached; scratch reservation cannot fit safely")
+        context = identity or {}
+        run_id = context.get("run_id")
+        foreground = bool(run_id and context.get("foreground"))
+        resource_requirements, resource_tags = _scheduler_resources(command.resources)
+        estimate = self._expected_duration(benchmark, index, command, context)
         owner_id = await self._owner_id()
         attempt_id = str(uuid.uuid4())
         staged = self.autobench / "scratch" / attempt_id
@@ -923,13 +1014,6 @@ class Engine:
         packet_manifest = self.state / "packets" / f"{attempt_id}.json"
         try:
             argv, environment = _substitute(command, snapshot, build, staged, self.project, artifacts or {}, _autobench_root(self.config))
-            selected = (identity or {}).get("selected_resource_ids")
-            requested_requirements, _ = _scheduler_resources(command.resources)
-            if any(item.get("kind") == "gpu" for item in requested_requirements) and (
-                (identity or {}).get("forecast_ready") is not True or not selected
-            ):
-                raise AutobenchError("GPU work requires a feasible-now forecast-selected stable Scheduler resource ID")
-            resource_requirements, resource_tags = _scheduler_resources(command.resources, selected if isinstance(selected, list) else None)
             packet_manifest.parent.mkdir(parents=True, exist_ok=True)
             packet_manifest.write_text(json.dumps({"argv": argv, "working_directory": str(snapshot), "allowed_root": str(self.project),
                                                   "result_directory": str(staged), "kill_seconds": command.kill_seconds,
@@ -947,26 +1031,18 @@ class Engine:
         key_expires = int(time.time()) + 7 * 24 * 60 * 60
         job_idempotency = f"autobench-v1:{key_expires}:{attempt_id}"
         details = {"kind": kind, "snapshot": str(snapshot), "build": str(build), "staged": str(staged), "benchmark": benchmark.name, "packet_index": index, "packet_name": command.name, "fingerprint": fingerprint, "manifest": str(packet_manifest), "idempotency_key": job_idempotency}
-        details.update(identity or {})
-        try:
-            self.store.begin_attempt(benchmark.name, benchmark.revision, index, fingerprint, attempt_id=attempt_id, state="prepared")
-            self.store.set(f"attempt:{attempt_id}", details)
-            self.store.set(f"reservation:{attempt_id}", {"bytes": reservation, "baseline_usage": _disk_usage(self.autobench)})
-            self.store.set_attempt(attempt_id, "submit_intent")
-        except Exception:
-            shutil.rmtree(staged, ignore_errors=True)
-            packet_manifest.unlink(missing_ok=True)
-            raise
+        details.update(context)
         spec: dict[str, Any] = {
             "owner_id": owner_id,
             "argv": [sys.executable, "-m", "autobench.worker", str(packet_manifest)],
             "working_directory": str(self.project),
             "resources": resource_requirements,
             "tags": ["autobench", f"benchmark:{benchmark.name}", f"kind:{kind}", *resource_tags],
-            "priority_class": "background", "priority": 10,
-            "flexible": True,
+            "priority_class": "interactive" if foreground else "background",
+            "priority": 80 if foreground else 10,
+            "flexible": not foreground,
             "timeout_seconds": command.kill_seconds + 10,
-            "expected_duration_seconds": self._expected_duration(benchmark, index, command, identity or {}),
+            "expected_duration_seconds": estimate,
             "kill_timeout_seconds": command.kill_seconds,
             "termination_grace_seconds": 5,
             "preemption_action": "abandon",
@@ -974,65 +1050,132 @@ class Engine:
             "idempotency_key": job_idempotency,
             "retention_policy": "autobench",
         }
-        if any(item.get("kind") == "gpu" for item in resource_requirements):
+        if run_id:
+            spec["deadline"] = (datetime.now(timezone.utc) + timedelta(seconds=context.get("admission_seconds", 60))).isoformat()
+        if any(str(item.get("kind", "")).casefold() == "gpu" for item in resource_requirements):
+            strict = kind not in {"correctness", "build"}
             spec["preconditions"] = [{"name": "gpu.quiescence", "schema_version": 1,
                                       "parameters": {"timeout_seconds": 30, "interval_seconds": 1,
-                                                     "consecutive_samples": 2, "max_utilization_percent": 0}}]
+                                                     "consecutive_samples": 2 if strict else 1,
+                                                     "max_utilization_percent": 0 if strict else 100}}]
+        details["scheduler_request"] = {"spec": spec}
+        details["submission_expires_at"] = key_expires
         try:
-            response = await self.scheduler.call("jobs.submit", {"spec": spec})
-        except Exception as exc:
-            # Submission may have succeeded remotely. Keep intent and recover via idempotency key.
-            self.store.set_attempt(attempt_id, "submit_intent", error=f"submission outcome unknown: {exc}")
-            raise SchedulerUnavailable("scheduler submission outcome is unknown; inspect the durable idempotency key before retry") from exc
-        job = job_object(response)
-        job_id = job.get("id", job.get("job_id"))
-        if not isinstance(job_id, str):
-            self.store.set_attempt(attempt_id, "submit_intent", error="scheduler returned no durable job id")
-            raise SchedulerUnavailable("scheduler accepted no identifiable durable job")
-        self.store.set_job(attempt_id, job_id)
+            fields = {"attempt_id": attempt_id, "state": "prepared"}
+            if run_id is not None:
+                fields["run_id"] = run_id
+            self.store.begin_attempt(benchmark.name, benchmark.revision, index, fingerprint, **fields)
+            self.store.set(f"attempt:{attempt_id}", details)
+            self.store.set(f"reservation:{attempt_id}", {"bytes": reservation})
+            self.store.set_attempt(attempt_id, "submit_intent",
+                                   {"phase": "submission", "reason_code": "submit_pending", "reason": "Waiting for Scheduler to acknowledge the request"})
+        except Exception:
+            shutil.rmtree(staged, ignore_errors=True)
+            packet_manifest.unlink(missing_ok=True)
+            raise
+        await self._dispatch_attempt(attempt_id, details, first_submit=True)
+        return attempt_id
 
-    def _reserved_bytes(self, current_usage: int | None = None) -> int:
-        current_usage = _disk_usage(self.autobench) if current_usage is None else current_usage
+    async def _dispatch_attempt(self, attempt_id: str, details: dict[str, Any], *, first_submit: bool = False) -> str | None:
+        request = details["scheduler_request"]
+        rejection = None
+        job: dict[str, Any] = {}
+        try:
+            response = await self.scheduler.call("jobs.submit", request)
+            if isinstance(response.get("error"), dict):
+                error = response["error"]
+                rejection = str(error.get("code", "operation_failed")), str(error.get("message", "Scheduler did not acknowledge the request"))
+            else:
+                job = dict(job_object(response))
+        except Exception as exc:
+            rejection = getattr(exc, "code", "transport_error"), str(exc)
+        job_id = job.get("id", job.get("job_id"))
+        if not isinstance(job_id, str) or not job_id:
+            code, message = rejection or ("scheduler_protocol_error", "Scheduler acknowledged no durable job ID")
+            # An authoritative rejection only proves non-acceptance of the first
+            # call. A replay can fail authorization after the original was accepted.
+            rejected = first_submit and code in {
+                "validation_error", "unauthorized", "permission_denied", "unsupported_capability",
+                "conflict", "idempotency_conflict", "not_found",
+            }
+            self.store.set_attempt(attempt_id, "not_submitted" if rejected else "submit_intent",
+                                   {"phase": "submission", "reason_code": code if rejected else "submission_unknown",
+                                    "reason": message, "scheduler_error_code": code, "cleanup_verified": rejected},
+                                   error=message)
+            if rejected:
+                shutil.rmtree(Path(details["staged"]), ignore_errors=True)
+                Path(details["manifest"]).unlink(missing_ok=True)
+                self.store.delete_setting(f"attempt:{attempt_id}")
+                self.store.delete_setting(f"reservation:{attempt_id}")
+            return None
+        self.store.set_job(attempt_id, job_id)
+        state, report = _job_progress(job)
+        self.store.set_attempt(attempt_id, state, report, error=report.get("reason"))
+        return job_id
+
+    def _reserved_bytes(self) -> int:
         total = 0
-        for row in self.store.db.execute("SELECT value FROM settings WHERE key LIKE 'reservation:%'"):
+        for row in self.store.db.execute("SELECT key, value FROM settings WHERE key LIKE 'reservation:%'"):
             try:
-                value = json.loads(row[0])
+                value = json.loads(row["value"])
                 if isinstance(value, int) and value > 0:
                     total += value
                 elif isinstance(value, dict):
                     amount = value.get("bytes", 0)
-                    baseline = value.get("baseline_usage", current_usage)
-                    if isinstance(amount, int) and amount > 0 and isinstance(baseline, int):
-                        spent = max(0, current_usage - baseline)
-                        total += max(0, amount - spent)
+                    if isinstance(amount, int) and amount > 0:
+                        attempt_id = row["key"].removeprefix("reservation:")
+                        total += max(0, amount - _disk_usage(self.autobench / "scratch" / attempt_id))
             except (TypeError, json.JSONDecodeError):
                 continue
         return total
 
-    async def _reconcile_jobs(self) -> int:
+    async def _reconcile_jobs(self, *, replay: bool = True) -> int:
         count = 0
         for attempt in self.store.unresolved():
+            details = self.store.get(f"attempt:{attempt['id']}", {})
             if not attempt["job_id"]:
-                # Recover an accepted submit by its stable idempotency key. An empty or
-                # incomplete list does not prove non-acceptance, so never retry here.
-                details = self.store.get(f"attempt:{attempt['id']}", {})
-                listing = await self.scheduler.call("jobs.list", {"limit": 100})
-                jobs = listing.get("jobs", listing.get("items", []))
-                if isinstance(jobs, list):
-                    found = next((j for j in jobs if isinstance(j, dict) and
-                                  (j.get("idempotency_key") == details.get("idempotency_key") or
-                                   (isinstance(j.get("spec"), dict) and j["spec"].get("idempotency_key") == details.get("idempotency_key")))), None)
-                else:
-                    found = None
-                if isinstance(found, dict):
-                    job_id = found.get("id", found.get("job_id"))
-                    if isinstance(job_id, str):
-                        self.store.set_job(attempt["id"], job_id)
+                if replay and isinstance(details.get("scheduler_request"), dict):
+                    if details.get("submission_expires_at", 0) > time.time():
+                        await self._dispatch_attempt(attempt["id"], details)
+                    else:
+                        self.store.set_attempt(attempt["id"], "submit_intent",
+                                               {"phase": "submission", "reason_code": "submission_key_expired",
+                                                "reason": "Scheduler did not acknowledge this request before its replay key expired"},
+                                               error="Scheduler submission remains unresolved after replay key expiry")
+                    continue
+                # Recover a positive match for an old intent or a paused workspace.
+                # Missing entries never prove that a request was not accepted.
+                key = details.get("idempotency_key")
+                if key:
+                    try:
+                        listing = await self.scheduler.call("jobs.list", {"limit": 100})
+                    except Exception:
+                        continue
+                    jobs = listing.get("jobs", listing.get("items", []))
+                    for listed in jobs if isinstance(jobs, list) else []:
+                        if not isinstance(listed, dict):
+                            continue
+                        spec = listed.get("spec")
+                        if listed.get("idempotency_key") == key or (isinstance(spec, dict) and spec.get("idempotency_key") == key):
+                            job_id = listed.get("id", listed.get("job_id"))
+                            if isinstance(job_id, str):
+                                self.store.set_job(attempt["id"], job_id)
+                            break
                 continue
-            response = await self.scheduler.call("jobs.get", {"job_id": attempt["job_id"]})
-            job = job_object(response)
+            try:
+                response = await self.scheduler.call("jobs.get", {"job_id": attempt["job_id"]})
+                job = dict(job_object(response))
+                if "state" not in job:
+                    raise SchedulerUnavailable("Scheduler returned no job status")
+            except Exception as exc:
+                message = str(exc)
+                self.store.set_attempt(attempt["id"], attempt["state"],
+                                       {"phase": "scheduler", "reason_code": "scheduler_unavailable", "reason": message},
+                                       error=message)
+                continue
             if not terminal(job):
-                self.store.set_attempt(attempt["id"], "running" if str(job.get("state", "")).lower() in {"running", "active"} else "submitted")
+                state, report = _job_progress(job)
+                self.store.set_attempt(attempt["id"], state, report, error=report.get("reason"))
                 usage = _disk_usage(self.autobench)
                 staged = self.autobench / "scratch" / attempt["id"]
                 worker_status = None
@@ -1045,17 +1188,35 @@ class Engine:
                 worker_stopped = worker_status in {"storage_over_cap", "timed_out"}
                 if (worker_stopped or
                     _disk_usage(staged) > self.limits["scratch_limit_bytes"] or
-                    usage + self._reserved_bytes(usage) > min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])) and not self.store.get(f"cancel_requested:{attempt['id']}", False):
-                    await self.scheduler.call("jobs.control", {"job_id": attempt["job_id"], "action": "cancel"})
-                    self.store.set(f"cancel_requested:{attempt['id']}", True)
+                    usage + self._reserved_bytes() > min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])) and not self.store.get(f"cancel_requested:{attempt['id']}", False):
+                    try:
+                        await self.scheduler.call("jobs.control", {"job_id": attempt["job_id"], "action": "cancel"})
+                        self.store.set(f"cancel_requested:{attempt['id']}", True)
+                    except Exception:
+                        # Scheduler may already be stopping the job. Recheck its
+                        # state on the next pass and keep its reservation pinned.
+                        pass
                 continue
             if not cleanup_verified(job):
-                self.store.set_attempt(attempt["id"], "cleanup_unknown", result={"scheduler_job": _compact_scheduler_job(dict(job))}, error="terminal scheduler job lacks verified cleanup receipt")
+                reason = "Scheduler has no verified cleanup receipt for this terminal job"
+                self.store.set_attempt(attempt["id"], "cleanup_unknown",
+                                       {"job": _compact_scheduler_job(job), "phase": "cleanup",
+                                        "reason_code": "cleanup_unverified", "reason": reason,
+                                        "cleanup_verified": False}, error=reason)
                 continue
-            details = self.store.get(f"attempt:{attempt['id']}", {})
-            staged = Path(details.get("staged", ""))
+            explicit = bool(details.get("run_id"))
+            staged = Path(details["staged"])
             result_path = staged / "result.json"
-            result = json.loads(result_path.read_text()) if result_path.exists() else {"status": "missing_result"}
+            try:
+                if result_path.is_symlink():
+                    raise ValueError("Worker result must be a regular file")
+                result = json.loads(result_path.read_text())
+                if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                    result = {"status": "invalid_output", "error": "Worker result does not contain a valid status"}
+            except FileNotFoundError:
+                result = {"status": "missing_result"}
+            except (OSError, ValueError):
+                result = {"status": "invalid_output", "error": "Worker result is unreadable or malformed"}
             scheduler_state = str(job.get("state", "")).casefold()
             scheduler_attempt = job.get("attempt") if isinstance(job.get("attempt"), dict) else {}
             scheduler_attempt_result = scheduler_attempt.get("result") if isinstance(scheduler_attempt.get("result"), dict) else {}
@@ -1078,6 +1239,7 @@ class Engine:
                     success = False
             if not success:
                 result = self._failure_diagnostics(result, staged, dict(job))
+            over_cap_publication = None
             if success and details.get("kind") == "build":
                 build = Path(details["build"])
                 build.mkdir(parents=True, exist_ok=True)
@@ -1088,15 +1250,20 @@ class Engine:
                     failed_result["status"] = "build_output_missing"
                     failed_result["error"] = "successful build produced no files"
                     failed_result = self._failure_diagnostics(failed_result, staged, dict(job))
-                    self.store.set_attempt(attempt["id"], "failed",
-                                           result={"scheduler_job": _compact_scheduler_job(dict(job)), "worker": failed_result, "cleanup_verified": True},
-                                           error="successful build produced no files")
+                    report = {"job": _compact_scheduler_job(job), "worker": failed_result,
+                              "phase": "build", "reason_code": "build_output_missing",
+                              "reason": failed_result["error"], "cleanup_verified": True}
+                    if explicit:
+                        report["evidence"] = self._retain_run_failure(details, attempt["id"], staged)
+                    self.store.set_attempt(attempt["id"], "failed", report, error=failed_result["error"])
                     shutil.rmtree(build, ignore_errors=True)
                     shutil.rmtree(staged, ignore_errors=True)
                     Path(details.get("manifest", "")).unlink(missing_ok=True)
                     self.store.delete_setting(f"attempt:{attempt['id']}")
                     self.store.delete_setting(f"reservation:{attempt['id']}")
-                    self.store.compact_history(details["benchmark"], -1, 16)
+                    if not explicit:
+                        self.store.compact_history(details["benchmark"], -1, 16)
+                    count += 1
                     continue
                 (build / "SUCCESS.json").write_text(json.dumps({"fingerprint": details["fingerprint"], "output_identity": output_identity, "benchmark": details["benchmark"], "attempt": attempt["id"]}), encoding="utf-8")
                 self.store.set(f"last-good-build:{details['benchmark']}", str(build))
@@ -1105,15 +1272,22 @@ class Engine:
                 benchmark = details["benchmark"]
                 index = int(details["packet_index"])
                 self._publish_result(benchmark, index, details["fingerprint"], attempt["id"], staged, details, job)
-                self._evict_safe()
                 cap = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
-                if _disk_usage(self.autobench) <= cap:
-                    self.store.mark_current(benchmark, index, details["fingerprint"], attempt["id"])
+                # Keep the staging copy until the ledger records the verdict.
+                # Only the published result will count after that point.
+                staged_bytes = _disk_usage(staged)
+                if not explicit and _disk_usage(self.autobench) - staged_bytes > cap:
+                    self._evict_safe()
+                if _disk_usage(self.autobench) - staged_bytes <= cap:
+                    if not explicit:
+                        self.store.mark_current(benchmark, index, details["fingerprint"], attempt["id"])
                     state = "succeeded"
                 else:
                     state = "storage_over_cap"
+                    if explicit:
+                        over_cap_publication = run_evidence(self, details["run_id"], details["packet_name"])
             else:
-                state = "preempted" if preempted else result.get("status", "failed")
+                state, reason_code, reason = _job_failure(job, result, preempted)
                 if state == "storage_over_cap":
                     failure_record = {
                         "fingerprint": details.get("fingerprint"),
@@ -1132,19 +1306,30 @@ class Engine:
             if not isinstance(protocol_fingerprint, str):
                 protocol_fingerprint = _protocol_fingerprint(details.get("protocol", {}))
             diagnostic_error = None
-            if state not in {"succeeded", "build_succeeded", "preempted"}:
-                diagnostic_error = str(result.get("error") or f"worker result: {result.get('status', state)}")
+            phase = "admission" if state in {"admission_timeout", "admission_failed"} else "finished"
+            report = {"job": _compact_scheduler_job(job), "worker": result, "phase": phase,
+                      "cleanup_verified": True,
+                      "identity": {"protocol_fingerprint": protocol_fingerprint,
+                                   "source_fingerprint": details.get("source_fingerprint"),
+                                   "build_fingerprint": details.get("build_fingerprint"),
+                                   "data_fingerprint": details.get("data_fingerprint"),
+                                   "device_identity": device_identity}}
+            if state not in {"succeeded", "build_succeeded"}:
+                if success:
+                    reason_code, reason = "storage_over_cap", "The result exceeded its storage budget"
+                report.update(reason_code=reason_code, reason=reason)
+                if explicit:
+                    report["evidence"] = self._retain_run_failure(details, attempt["id"], staged)
+                diagnostic_error = reason
                 stderr_tail = result.get("diagnostics", {}).get("stderr_tail") if isinstance(result.get("diagnostics"), dict) else None
                 if isinstance(stderr_tail, str) and stderr_tail:
                     diagnostic_error += ": " + _bounded_tail(stderr_tail, 1024)[0]
-            self.store.set_attempt(attempt["id"], state, {"job": _compact_scheduler_job(dict(job)), "worker": result,
-                                                            "identity": {"protocol_fingerprint": protocol_fingerprint,
-                                                                         "source_fingerprint": details.get("source_fingerprint"),
-                                                                         "build_fingerprint": details.get("build_fingerprint"),
-                                                                         "data_fingerprint": details.get("data_fingerprint"),
-                                                                         "device_identity": device_identity}},
-                                   error=diagnostic_error)
-            self.store.compact_history(details["benchmark"], int(details.get("packet_index", -1)), 16)
+            self.store.set_attempt(attempt["id"], state, report, error=diagnostic_error)
+            if over_cap_publication is not None:
+                (over_cap_publication / "current.json").unlink(missing_ok=True)
+                shutil.rmtree(over_cap_publication / details["fingerprint"], ignore_errors=True)
+            if not explicit:
+                self.store.compact_history(details["benchmark"], int(details.get("packet_index", -1)), 16)
             shutil.rmtree(staged, ignore_errors=True)
             Path(details.get("manifest", "")).unlink(missing_ok=True)
             self._evict_safe()
@@ -1155,7 +1340,8 @@ class Engine:
                     shutil.rmtree(build, ignore_errors=True)
                     self.store.set(f"build-storage-error:{details['benchmark']}", {"fingerprint": details["fingerprint"], "cap": cap,
                                                                                      "scratch_limit": self.limits["scratch_limit_bytes"]})
-                    self.store.set_attempt(attempt["id"], "storage_over_cap", result={"scheduler_job": _compact_scheduler_job(dict(job)), "cleanup_verified": True}, error="build exceeded its storage budget")
+                    report.update(reason_code="storage_over_cap", reason="The build exceeded its storage budget")
+                    self.store.set_attempt(attempt["id"], "storage_over_cap", report, error=report["reason"])
                 else:
                     self.store.delete_setting(f"build-storage-error:{details['benchmark']}")
             self.store.delete_setting(f"attempt:{attempt['id']}")
@@ -1176,7 +1362,9 @@ class Engine:
         return target / str(pointer["fingerprint"])
 
     def _publish_result(self, benchmark: str, packet_index: int, fingerprint: str, attempt_id: str, staged: Path, details: dict[str, Any], job: dict[str, Any]) -> None:
-        target = self.autobench / "evidence" / benchmark / str(packet_index)
+        run_id = details.get("run_id")
+        target = (run_evidence(self, run_id, details["packet_name"]) if run_id else
+                  self.autobench / "evidence" / benchmark / str(packet_index))
         target.mkdir(parents=True, exist_ok=True)
         current_file = target / "current.json"
         previous = json.loads(current_file.read_text()) if current_file.exists() else None
@@ -1216,18 +1404,50 @@ class Engine:
         for artifact in target.iterdir():
             if artifact.is_dir() and artifact.name not in keep_artifacts:
                 shutil.rmtree(artifact, ignore_errors=True)
-        # Keep current + one prior baseline and compact summaries for 16 attempts.
-        rows = self.store.attempts_for(benchmark)
+        if run_id:
+            return
+        # Keep current + one prior baseline and compact summaries for 16 background attempts.
+        rows = [row for row in self.store.attempts_for(benchmark)
+                if self.store.attempt_run_id(row["id"]) is None]
         keep = {r["id"] for r in rows[:16]}
         for row in rows:
             if row["id"] not in keep and row.get("result_json"):
                 self.store.db.execute("UPDATE attempts SET result_json=NULL WHERE id=?", (row["id"],))
         self.store.db.commit()
 
+    def _retain_run_failure(self, details: dict[str, Any], attempt_id: str, staged: Path) -> str | None:
+        run_id = details.get("run_id")
+        if not run_id:
+            return None
+        tails = {}
+        for filename in ("stdout.log", "stderr.log"):
+            tail, _ = _read_file_tail(staged / filename, 2048)
+            if tail:
+                tails[filename] = tail
+        if not tails:
+            return None
+        target = run_evidence(self, run_id, details["packet_name"]) / attempt_id
+        target.mkdir(parents=True, exist_ok=True)
+        for filename, tail in tails.items():
+            (target / filename).write_text(tail, encoding="utf-8")
+        return str(target)
+
     def _evict_safe(self, required_free: int = 0) -> None:
+        # Acceptance only needs to serialize with cache removal, not the
+        # coordinator's Scheduler calls. An in-progress capture owns this lock.
+        with self._workspace_writer_lock("capture.lock") as acquired:
+            if acquired:
+                self._evict_safe_locked(required_free)
+
+    def _evict_safe_locked(self, required_free: int = 0, *, extra_pins: set[str] | None = None) -> None:
         # Snapshot cache is reproducible from live source. Preserve snapshots referenced by
         # unresolved jobs and the last registered source fingerprints.
-        pinned: set[str] = set()
+        pinned = set(extra_pins or ())
+        for run in self.store.active_runs():
+            request = run["request"]
+            pinned.add(request["snapshot"])
+            if request.get("build_fingerprint"):
+                pinned.add(str(self.autobench / "builds" / request["build_fingerprint"]))
         cap = min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
         target = max(0, cap - max(0, required_free))
         for row in self.store.db.execute("SELECT key,value FROM settings WHERE key LIKE 'last-good-build:%'"):
@@ -1269,10 +1489,17 @@ class Engine:
             for directory in sorted((p for p in builds.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime):
                 if str(directory) not in pinned and _disk_usage(self.autobench) > target * 4 // 5:
                     shutil.rmtree(directory, ignore_errors=True)
+        # Evict completed run artifacts before touching active dependency outputs.
+        for run in self.store.terminal_runs():
+            if _disk_usage(self.autobench) <= target:
+                break
+            shutil.rmtree(run_evidence(self, run["id"]), ignore_errors=True)
         # Under pressure, preserve compact current/baseline metrics and provenance
         # while dropping bulky profiler captures. Raw capture eviction is explicit.
         if _disk_usage(self.autobench) > target:
             for pointer_path in sorted(evidence.rglob("*.json")) if evidence.exists() else []:
+                if pointer_path.is_relative_to(evidence / "runs"):
+                    continue
                 if pointer_path.name not in {"current.json", "baseline.json"}:
                     continue
                 try:
@@ -1303,7 +1530,7 @@ class Engine:
                 for attempt in self.store.unresolved():
                     over_scratch = _disk_usage(self.autobench / "scratch" / attempt["id"]) > self.limits["scratch_limit_bytes"]
                     usage = _disk_usage(self.autobench)
-                    over_cap = usage + self._reserved_bytes(usage) > min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
+                    over_cap = usage + self._reserved_bytes() > min(int(self.store.get("retained_cap_bytes", 1024**3)), self.limits["retained_cap_bytes"])
                     if attempt["job_id"] and (over_scratch or over_cap) and not self.store.get(f"cancel_requested:{attempt['id']}", False):
                         try:
                             await self.scheduler.call("jobs.control", {"job_id": attempt["job_id"], "action": "cancel"})

@@ -4,15 +4,23 @@ from __future__ import annotations
 import json
 import math
 import os
+import sqlite3
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .catalog import Catalog
+from .errors import RegistrationError, SchedulerUnavailable
 from .instructions import update_agent_instructions, validate_agent_instructions
-from .registry import load_registry, parse_registration, write_registration
+from .registry import load_registry, parse_registration, registration_from_mapping, write_registration
 from .settings import host_limits
 from .store import Store
+
+if TYPE_CHECKING:
+    from .engine import Engine
+    from .models import Benchmark
+    from .scheduler import Scheduler
 
 
 class _LocalOnlyScheduler:
@@ -422,6 +430,154 @@ async def reconcile_project(project: str | Path = ".", *, scheduler: Any | None 
     engine = _workspace_engine(root, scheduler)
     try:
         return await engine.reconcile_once()
+    finally:
+        engine.close()
+
+
+def _run_blocker(phase: str, reason_code: str, reason: str, next_action: str,
+                 *, run_id: str | None = None) -> dict[str, Any]:
+    result = {"state": "blocked", "phase": phase, "reason_code": reason_code,
+              "reason": reason, "next_action": next_action}
+    if run_id is not None:
+        result["run_id"] = run_id
+    return result
+
+
+def _open_run_engine(root: Path, scheduler: Scheduler | None,
+                     *, run_id: str | None = None) -> Engine | dict[str, Any]:
+    if not root.is_dir():
+        return _run_blocker("setup", "workspace_not_found", f"Workspace directory does not exist: {root}",
+                            "Pass an existing workspace directory with --project.", run_id=run_id)
+    config_path = root / ".autobench" / "config.json"
+    if not config_path.is_file():
+        return _run_blocker("setup", "workspace_uninitialized", "Autobench workspace is not initialized",
+                            "Run autobench init with this workspace's Scheduler URL and token file.",
+                            run_id=run_id)
+    if not (root / ".autobench" / "state" / "autobench.sqlite3").is_file():
+        return _run_blocker("setup", "workspace_state_missing", "The workspace state database is missing",
+                            "Restore the existing workspace state before running a benchmark.", run_id=run_id)
+    try:
+        settings = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(settings, dict):
+            raise ValueError("workspace configuration must be a JSON object")
+        if scheduler is None:
+            url = settings.get("scheduler_url")
+            token = settings.get("token_file")
+            if not isinstance(url, str) or not url or not isinstance(token, str) or not token:
+                return _run_blocker("setup", "scheduler_unconfigured", "Device Scheduler is not configured",
+                                    "Run autobench init with this workspace's Scheduler URL and token file.",
+                                    run_id=run_id)
+            token_path = Path(token).expanduser()
+            if not token_path.is_file() or not os.access(token_path, os.R_OK):
+                return _run_blocker("setup", "scheduler_token_unreadable", "The configured Scheduler token file cannot be read",
+                                    "Restore access to the token file or update the workspace configuration.",
+                                    run_id=run_id)
+            from .scheduler import McpScheduler
+            scheduler = McpScheduler(url, str(token_path))
+        return _workspace_engine(root, scheduler)
+    except SchedulerUnavailable as exc:
+        return _run_blocker("setup", "scheduler_client_unavailable", str(exc),
+                            "Install the Device Scheduler Python SDK in the Autobench environment.", run_id=run_id)
+    except (OSError, ValueError) as exc:
+        return _run_blocker("setup", "workspace_config_invalid", str(exc),
+                            "Repair the workspace's Autobench configuration.", run_id=run_id)
+    except sqlite3.DatabaseError as exc:
+        return _run_blocker("setup", "workspace_state_unavailable", str(exc),
+                            "Inspect the workspace's Autobench state database.", run_id=run_id)
+
+
+def _run_benchmark(root: Path, *, name: str | None, definition: str | Path | None,
+                   argv: Sequence[str] | None, include: Sequence[str], data: Sequence[str],
+                   kind: str | None, gpu: int | None, gpu_memory_mib: int | None,
+                   expected_seconds: int | None, kill_seconds: int | None) -> Benchmark:
+    if sum(value is not None for value in (name, definition, argv)) != 1:
+        raise RegistrationError("specify one of a registered name, --file, or argv after --")
+    if argv is None:
+        if include or data or any(value is not None for value in
+                                  (kind, gpu, gpu_memory_mib, expected_seconds, kill_seconds)):
+            raise RegistrationError("input, resource, kind, and runtime flags apply to raw argv runs")
+        if definition is not None:
+            return parse_registration(Path(definition).expanduser().resolve(), root)
+        benchmark = next((item for item in load_registry(root) if item.name == name), None)
+        if benchmark is None:
+            raise RegistrationError(f"no registered benchmark named {name!r}")
+        return benchmark
+
+    if isinstance(argv, (str, bytes)) or isinstance(include, (str, bytes)) or isinstance(data, (str, bytes)):
+        raise RegistrationError("argv, include, and data must be sequences of strings")
+    if (gpu is None) != (gpu_memory_mib is None):
+        raise RegistrationError("specify --gpu and --gpu-memory-mib together")
+    resources: dict[str, Any] = {}
+    if gpu is not None:
+        if type(gpu) is not int or not 1 <= gpu <= 16:
+            raise RegistrationError("--gpu must be an integer from 1 through 16")
+        if type(gpu_memory_mib) is not int or gpu_memory_mib < 1:
+            raise RegistrationError("--gpu-memory-mib must be a positive integer")
+        resources = {"gpu_count": gpu, "gpu_memory_bytes": gpu_memory_mib * 1024**2}
+    if kind is None:
+        kind = "timing"
+    if kind not in ("timing", "correctness"):
+        raise RegistrationError("raw argv runs support timing or correctness")
+    if any(value is not None and type(value) is not int for value in (expected_seconds, kill_seconds)):
+        raise RegistrationError("expected and hard-runtime seconds must be integers")
+    recipe = {"benchmark": {"name": "argv"}, "source": {"include": list(include)},
+              "data": {"paths": list(data)}, "packet": [{
+                  "kind": kind, "argv": list(argv), "resources": resources,
+                  "expected_seconds": 5 if expected_seconds is None else expected_seconds,
+                  "kill_seconds": 30 if kill_seconds is None else kill_seconds,
+              }]}
+    return registration_from_mapping(recipe, root, label="argv")
+
+
+async def start_run(project: str | Path = ".", *, name: str | None = None,
+                    definition: str | Path | None = None, argv: Sequence[str] | None = None,
+                    include: Sequence[str] = (), data: Sequence[str] = (), kind: str | None = None,
+                    gpu: int | None = None, gpu_memory_mib: int | None = None,
+                    expected_seconds: int | None = None, kill_seconds: int | None = None,
+                    admission_seconds: int = 60, foreground: bool = False,
+                    scheduler: Scheduler | None = None) -> dict[str, Any]:
+    """Freeze and accept one explicit run, returning its durable ID or a blocker."""
+    from .run import RunBlocked, start_run as accept_run
+
+    root = Path(project).expanduser().resolve()
+    engine = _open_run_engine(root, scheduler)
+    if isinstance(engine, dict):
+        return engine
+    try:
+        try:
+            benchmark = _run_benchmark(root, name=name, definition=definition, argv=argv,
+                                       include=include, data=data, kind=kind, gpu=gpu,
+                                       gpu_memory_mib=gpu_memory_mib, expected_seconds=expected_seconds,
+                                       kill_seconds=kill_seconds)
+        except (RegistrationError, ValueError) as exc:
+            return _run_blocker("validation", "invalid_recipe", str(exc),
+                                "Correct the benchmark name, recipe, or argv options.")
+        try:
+            run_id = await accept_run(engine, benchmark, foreground=foreground, admission_seconds=admission_seconds)
+        except RunBlocked as exc:
+            return exc.result
+        return {"run_id": run_id, "state": "accepted", "phase": "accepted"}
+    finally:
+        engine.close()
+
+
+async def wait_run(project: str | Path, run_id: str, *, wait_seconds: float | None = None,
+                   scheduler: Scheduler | None = None) -> dict[str, Any]:
+    """Wait within the run's bounds, returning evidence, a blocker, or reconnect state."""
+    from .run import RunBlocked, wait_run as collect_run
+
+    if wait_seconds is not None and (isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float))
+                                     or not math.isfinite(wait_seconds) or wait_seconds < 0):
+        return _run_blocker("validation", "invalid_wait_time", "Wait seconds must be a nonnegative finite number",
+                            "Set --wait-seconds to a nonnegative number.", run_id=run_id)
+    root = Path(project).expanduser().resolve()
+    engine = _open_run_engine(root, scheduler, run_id=run_id)
+    if isinstance(engine, dict):
+        return engine
+    try:
+        return await collect_run(engine, run_id, wait_seconds=wait_seconds)
+    except RunBlocked as exc:
+        return {"run_id": run_id, **exc.result}
     finally:
         engine.close()
 

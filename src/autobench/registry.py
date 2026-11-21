@@ -15,9 +15,13 @@ _NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
 def _command(raw: dict[str, Any] | None, default_kind: str) -> Command | None:
     if raw is None:
         return None
+    if not isinstance(raw, dict):
+        raise RegistrationError(f"{default_kind} command must be a TOML table")
     argv = raw.get("argv")
-    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv):
-        raise RegistrationError("command.argv must be a non-empty array of strings")
+    if not isinstance(argv, list) or not argv or not argv[0] or not all(
+        isinstance(x, str) and "\x00" not in x for x in argv
+    ):
+        raise RegistrationError("command.argv must contain an executable and valid string arguments")
     expected = raw.get("expected_seconds")
     kill = raw.get("kill_seconds")
     if not isinstance(expected, int) or expected < 1 or not isinstance(kill, int) or kill <= expected:
@@ -47,15 +51,26 @@ def parse_registration(path: Path, root: Path) -> Benchmark:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise RegistrationError(f"cannot read {path}: {exc}") from exc
+    return registration_from_mapping(raw, root, label=str(path))
+
+
+def registration_from_mapping(raw: dict[str, Any], root: Path, *, label: str) -> Benchmark:
+    """Validate the recipe shared by file registrations and explicit argv runs."""
     meta = raw.get("benchmark", {})
+    if not isinstance(meta, dict):
+        raise RegistrationError("[benchmark] must be a TOML table")
     benchmark_name = meta.get("name")
     if not isinstance(benchmark_name, str) or not _NAME.fullmatch(benchmark_name):
-        raise RegistrationError(f"invalid benchmark name in {path}")
+        raise RegistrationError(f"invalid benchmark name in {label}")
     protocol = raw.get("protocol", {})
     if not isinstance(protocol, dict):
         raise RegistrationError("[protocol] must be a TOML table")
-    includes = raw.get("source", {}).get("include", [])
-    data = raw.get("data", {}).get("paths", [])
+    source_table = raw.get("source", {})
+    data_table = raw.get("data", {})
+    if not isinstance(source_table, dict) or not isinstance(data_table, dict):
+        raise RegistrationError("[source] and [data] must be TOML tables")
+    includes = source_table.get("include", [])
+    data = data_table.get("paths", [])
     if not includes and not data:
         raise RegistrationError("registration must declare source.include or data.paths")
     for label, paths in (("source.include", includes), ("data.paths", data)):

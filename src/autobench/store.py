@@ -54,6 +54,88 @@ class Store:
                 self.db.close()
                 raise sqlite3.DatabaseError(f"Autobench database integrity check failed: {path}")
 
+        if not {"runs", "run_attempts"}.issubset({row[0] for row in schema}):
+            self.db.executescript("""
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS runs (
+              id TEXT PRIMARY KEY, state TEXT NOT NULL, request_json TEXT NOT NULL,
+              result_json TEXT, created REAL NOT NULL, updated REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_attempts (
+              attempt_id TEXT PRIMARY KEY REFERENCES attempts(id) ON DELETE CASCADE,
+              run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS run_attempts_run ON run_attempts(run_id);
+            COMMIT;
+            """)
+
+    def begin_run(self, run_id: str, request: dict) -> None:
+        now = time.time()
+        with self.db:
+            self.db.execute("INSERT INTO runs VALUES(?,?,?,?,?,?)",
+                            (run_id, "pending", json.dumps(request), None, now, now))
+
+    @staticmethod
+    def _run_record(row: sqlite3.Row) -> dict:
+        record = dict(row)
+        record["request"] = json.loads(record.pop("request_json"))
+        result = record.pop("result_json")
+        record["result"] = json.loads(result) if result is not None else None
+        return record
+
+    def get_run(self, run_id: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return self._run_record(row) if row is not None else None
+
+    def active_runs(self) -> list[dict]:
+        return [self._run_record(row) for row in self.db.execute(
+            "SELECT * FROM runs WHERE state IN ('pending','running') ORDER BY created, rowid"
+        )]
+
+    def terminal_runs(self) -> list[dict]:
+        return [self._run_record(row) for row in self.db.execute(
+            "SELECT * FROM runs WHERE state NOT IN ('pending','running') ORDER BY updated, rowid"
+        )]
+
+    def set_run(self, run_id: str, state: str, result: dict | None = None) -> None:
+        with self.db:
+            cursor = self.db.execute("UPDATE runs SET state=?,result_json=?,updated=? WHERE id=?",
+                                     (state, json.dumps(result) if result is not None else None, time.time(), run_id))
+            if not cursor.rowcount:
+                raise KeyError(run_id)
+
+    def run_attempts(self, run_id: str) -> list[dict]:
+        return [dict(row) for row in self.db.execute(
+            "SELECT attempts.* FROM attempts JOIN run_attempts ON attempts.id=run_attempts.attempt_id "
+            "WHERE run_attempts.run_id=? ORDER BY attempts.created, attempts.rowid", (run_id,)
+        )]
+
+    def attempt_run_id(self, attempt_id: str) -> str | None:
+        row = self.db.execute("SELECT run_id FROM run_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        return row[0] if row is not None else None
+
+    def compact_runs(self, keep: int = 100) -> list[str]:
+        """Drop old terminal records whose attempts no longer require reconciliation."""
+        if keep < 0:
+            raise ValueError("keep must be nonnegative")
+        with self.db:
+            stale = [row[0] for row in self.db.execute("""
+                SELECT runs.id FROM runs WHERE state NOT IN ('pending','running')
+                AND NOT EXISTS (
+                  SELECT 1 FROM run_attempts JOIN attempts ON attempts.id=run_attempts.attempt_id
+                  WHERE run_attempts.run_id=runs.id
+                    AND attempts.state IN ('prepared','submit_intent','submitted','running','cleanup_unknown')
+                )
+                ORDER BY runs.updated DESC, runs.rowid DESC LIMIT -1 OFFSET ?
+            """, (keep,))]
+            for run_id in stale:
+                attempts = self.run_attempts(run_id)
+                self.db.executemany("DELETE FROM settings WHERE key=?",
+                                    ((prefix + row["id"],) for row in attempts for prefix in ("attempt:", "reservation:", "cancel_requested:")))
+                self.db.execute("DELETE FROM attempts WHERE id IN (SELECT attempt_id FROM run_attempts WHERE run_id=?)", (run_id,))
+                self.db.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        return stale
+
     def close(self) -> None:
         self.db.close()
 
@@ -78,12 +160,14 @@ class Store:
             "coverage": [dict(row) for row in self.db.execute("SELECT * FROM coverage ORDER BY benchmark,packet_index")],
         }
 
-    def begin_attempt(self, benchmark: str, revision: int, packet_index: int, fingerprint: str, *, attempt_id: str | None = None, state: str = "submit_intent") -> str:
+    def begin_attempt(self, benchmark: str, revision: int, packet_index: int, fingerprint: str, *, attempt_id: str | None = None, state: str = "submit_intent", run_id: str | None = None) -> str:
         import uuid
         attempt_id = attempt_id or str(uuid.uuid4())
         now = time.time()
-        self.db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)", (attempt_id, benchmark, revision, packet_index, fingerprint, None, state, now, now, None, None))
-        self.db.commit()
+        with self.db:
+            self.db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,?)", (attempt_id, benchmark, revision, packet_index, fingerprint, None, state, now, now, None, None))
+            if run_id is not None:
+                self.db.execute("INSERT INTO run_attempts VALUES(?,?)", (attempt_id, run_id))
         return attempt_id
 
     def set_job(self, attempt_id: str, job_id: str, state: str = "submitted") -> None:
@@ -109,13 +193,17 @@ class Store:
         return [dict(r) for r in self.db.execute("SELECT * FROM attempts WHERE benchmark=? ORDER BY created DESC LIMIT 100", (benchmark,))]
 
     def compact_history(self, benchmark: str, packet_index: int, keep: int = 16) -> None:
-        count = self.db.execute("SELECT COUNT(*) FROM attempts WHERE benchmark=? AND packet_index=? AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown')", (benchmark, packet_index)).fetchone()[0]
-        if count <= keep:
-            return
-        stale = [row[0] for row in self.db.execute("SELECT id FROM attempts WHERE benchmark=? AND packet_index=? AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown') AND id NOT IN (SELECT id FROM attempts WHERE benchmark=? AND packet_index=? ORDER BY created DESC LIMIT ?)", (benchmark, packet_index, benchmark, packet_index, keep))]
-        self.db.execute("DELETE FROM attempts WHERE benchmark=? AND packet_index=? AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown') AND id NOT IN (SELECT id FROM attempts WHERE benchmark=? AND packet_index=? ORDER BY created DESC LIMIT ?)", (benchmark, packet_index, benchmark, packet_index, keep))
-        self.db.executemany("DELETE FROM settings WHERE key=?", [(f"attempt:{attempt_id}",) for attempt_id in stale])
-        self.db.commit()
+        with self.db:
+            stale = [row[0] for row in self.db.execute("""
+                SELECT attempts.id FROM attempts
+                WHERE benchmark=? AND packet_index=?
+                  AND state NOT IN ('prepared','submit_intent','submitted','running','cleanup_unknown')
+                  AND NOT EXISTS (SELECT 1 FROM run_attempts WHERE attempt_id=attempts.id)
+                ORDER BY created DESC, attempts.rowid DESC LIMIT -1 OFFSET ?
+            """, (benchmark, packet_index, keep))]
+            if not stale:
+                return
+            self.db.executemany("DELETE FROM attempts WHERE id=?", [(attempt_id,) for attempt_id in stale])
+            self.db.executemany("DELETE FROM settings WHERE key=?", [(f"attempt:{attempt_id}",) for attempt_id in stale])
         self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.db.execute("VACUUM")
-

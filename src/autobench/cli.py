@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -11,7 +12,7 @@ from typing import Any
 
 from . import __version__
 from .api import (init_project, pause_project, reconcile_project, register_benchmark,
-                  register_definition, resume_project, workspace_compare, workspace_explain,
+                  register_definition, resume_project, start_run, wait_run, workspace_compare, workspace_explain,
                   workspace_results, workspace_status)
 from .catalog import Catalog
 from .engine import Engine
@@ -55,34 +56,56 @@ async def _serve(project: Path) -> None:
         engine.close()
 
 
-async def _serve_global() -> None:
-    while True:
+async def _reconcile_enrolled(project: Path, slots: asyncio.Semaphore) -> None:
+    async with slots:
+        config_path = project / ".autobench" / "config.json"
+        if not project.is_dir() or not config_path.exists():
+            return
         try:
-            catalog = Catalog(create=False)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if not config.get("scheduler_url") or not config.get("token_file"):
+                return
+            if not config.get("active"):
+                store = Store(project / ".autobench" / "state" / "autobench.sqlite3", create=False)
+                try:
+                    draining = store.get("paused", False) and store.unresolved()
+                finally:
+                    store.close()
+                if not draining:
+                    return
+            engine = Engine(project, McpScheduler(config["scheduler_url"], config["token_file"]))
+            try:
+                await engine.reconcile_once()
+            finally:
+                engine.close()
         except Exception as exc:
-            print(f"autobench: workspace catalog unavailable: {exc}", file=sys.stderr)
-            await asyncio.sleep(5)
-            continue
-        try:
-            projects = catalog.workspaces()
-        finally:
-            catalog.close()
-        for project in projects:
-            config_path = project / ".autobench" / "config.json"
-            if not project.is_dir() or not config_path.exists():
+            print(f"autobench: coordinator could not reconcile {project}: {exc}", file=sys.stderr)
+
+
+async def _serve_global() -> None:
+    tasks: dict[Path, asyncio.Task] = {}
+    slots = asyncio.Semaphore(4)
+    try:
+        while True:
+            try:
+                catalog = Catalog(create=False)
+            except Exception as exc:
+                print(f"autobench: workspace catalog unavailable: {exc}", file=sys.stderr)
+                await asyncio.sleep(5)
                 continue
             try:
-                config = json.loads(config_path.read_text(encoding="utf-8"))
-                if not config.get("active") or not config.get("scheduler_url") or not config.get("token_file"):
-                    continue
-                engine = Engine(project, McpScheduler(config["scheduler_url"], config["token_file"]))
-                try:
-                    await engine.reconcile_once()
-                finally:
-                    engine.close()
-            except Exception as exc:
-                print(f"autobench: coordinator could not reconcile {project}: {exc}", file=sys.stderr)
-        await asyncio.sleep(5)
+                projects = catalog.workspaces(active_only=False)
+            finally:
+                catalog.close()
+            tasks = {project: task for project, task in tasks.items() if not task.done()}
+            for project in projects:
+                if project not in tasks:
+                    tasks[project] = asyncio.create_task(_reconcile_enrolled(project, slots))
+            await asyncio.sleep(5)
+    finally:
+        for task in tasks.values():
+            task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
 
 
 def _set_project_active(project: Path, active: bool) -> None:
@@ -148,7 +171,8 @@ async def _cmd_init(args: argparse.Namespace) -> int:
         readiness = "ready"
     else:
         readiness = "incomplete: Scheduler grants are valid, but the preinstalled Autobench coordinator service did not start"
-    result.update({"initialized": True, "service_activated": activated, "activation": activation_message,
+    result.update({"initialized": True, "active": bool(scheduler_ready and args.activate),
+                   "service_activated": activated, "activation": activation_message,
                    "scheduler_access": access_report, "readiness": readiness})
     print(json.dumps(result, indent=2))
     return 0
@@ -171,6 +195,31 @@ def _cmd_register(args: argparse.Namespace) -> int:
                                   expected_seconds=args.expected_seconds, kill_seconds=args.kill_seconds, kind=args.kind)
     print(path)
     return 0
+
+
+def _run_json(result: dict[str, Any]) -> None:
+    print(json.dumps(result, separators=(",", ":"), default=str), flush=True)
+
+
+async def _cmd_run(args: argparse.Namespace) -> int:
+    accepted = await start_run(
+        args.project, name=args.name, definition=args.file, argv=args.argv, include=args.include,
+        data=args.data, kind=args.kind, gpu=args.gpu, gpu_memory_mib=args.gpu_memory_mib,
+        expected_seconds=args.expected_seconds, kill_seconds=args.kill_seconds,
+        admission_seconds=args.admission_seconds, foreground=args.foreground,
+    )
+    _run_json(accepted)
+    if accepted["state"] != "accepted":
+        return 1
+    result = await wait_run(args.project, accepted["run_id"], wait_seconds=args.wait_seconds)
+    _run_json(result)
+    return 0 if result["state"] == "succeeded" else 1
+
+
+async def _cmd_wait(args: argparse.Namespace) -> int:
+    result = await wait_run(args.project, args.run_id, wait_seconds=args.wait_seconds)
+    _run_json(result)
+    return 0 if result["state"] == "succeeded" else 1
 
 
 async def _async_action(args: argparse.Namespace) -> int:
@@ -227,6 +276,16 @@ def _explain(engine: Engine, name: str) -> dict[str, Any]:
             "reason": "coverage is current for the recorded source fingerprint" if coverage else "no complete result has been recorded"}
 
 
+def _wait_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("wait seconds must be a nonnegative finite number") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError("wait seconds must be a nonnegative finite number")
+    return seconds
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autobench", description="Continuously maintain registered benchmark evidence")
     parser.add_argument("--version", action="version", version=__version__)
@@ -247,6 +306,25 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument("--expected-seconds", type=int, default=5)
     reg.add_argument("--kill-seconds", type=int, default=30)
     reg.add_argument("--kind", default="correctness")
+    run = sub.add_parser("run", help="run a registered benchmark, recipe, or raw argv and collect its result",
+                         usage="autobench run [options] (NAME | --file RECIPE | -- ARGV...)")
+    run.add_argument("name", nargs="?", help="a registered benchmark name")
+    run.add_argument("--project", default=".")
+    run.add_argument("--file", help="run a TOML recipe once")
+    run.add_argument("--include", action="append", default=[], help="declare a raw run's workspace-relative source glob")
+    run.add_argument("--data", action="append", default=[], help="declare a raw run's workspace-relative data glob")
+    run.add_argument("--kind", choices=("timing", "correctness"), help="raw packet kind, timing by default")
+    run.add_argument("--gpu", type=int, help="number of exclusive GPUs requested by a raw run")
+    run.add_argument("--gpu-memory-mib", type=int, help="requested memory per GPU, required with --gpu")
+    run.add_argument("--expected-seconds", type=int, help="raw runtime estimate, 5 by default")
+    run.add_argument("--kill-seconds", type=int, help="raw hard runtime limit, 30 by default")
+    run.add_argument("--admission-seconds", type=int, default=60, help="per-packet admission deadline, 60 by default")
+    run.add_argument("--foreground", action="store_true", help="request interactive priority using the configured grant")
+    run.add_argument("--wait-seconds", type=_wait_seconds, help="bound the client wait without cancelling the run")
+    wait = sub.add_parser("wait", help="reconnect to an existing explicit run and collect its result")
+    wait.add_argument("run_id")
+    wait.add_argument("--project", default=".")
+    wait.add_argument("--wait-seconds", type=_wait_seconds, help="bound the client wait without cancelling the run")
     for name in ("status", "doctor", "serve", "reconcile"):
         p = sub.add_parser(name)
         p.add_argument("--project", default=None if name == "serve" else ".")
@@ -267,9 +345,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    packet_argv: list[str] = []
+    packet_argv: list[str] | None = None
     parse_args = raw_args
-    if raw_args and raw_args[0] == "register":
+    if raw_args and raw_args[0] in {"register", "run"}:
         try:
             separator = raw_args.index("--")
         except ValueError:
@@ -279,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
             packet_argv = raw_args[separator + 1:]
     args = parser.parse_args(parse_args)
     if args.command == "register":
+        args.argv = packet_argv or []
+    elif args.command == "run":
         args.argv = packet_argv
     try:
         if args.command == "init":
@@ -289,6 +369,10 @@ def main(argv: list[str] | None = None) -> int:
             if not args.file and not args.argv:
                 parser.error("register requires argv after --")
             return _cmd_register(args)
+        if args.command == "run":
+            return asyncio.run(_cmd_run(args))
+        if args.command == "wait":
+            return asyncio.run(_cmd_wait(args))
         if args.command == "workspaces":
             try:
                 catalog = Catalog(create=False)

@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import os
 import shutil
+import tempfile
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -113,58 +114,80 @@ def fingerprint_manifest(manifest: dict[str, str]) -> str:
     return hashlib.sha256("\n".join(f"{key}\0{manifest[key]}" for key in sorted(manifest)).encode()).hexdigest()
 
 
+_EXECUTABLE_BITS = 0o111
+
+
+def _input_identity(path: Path, executable_bits: int) -> str:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    # Executable inputs previously collided with byte-identical non-executable
+    # inputs. Retain old identities only where the old snapshot remains valid.
+    return f"{digest}:x{executable_bits:03o}" if executable_bits else digest
+
+
 def observe(benchmark: Benchmark) -> tuple[str, dict[str, str]]:
     """Read current scoped identities without materializing a snapshot."""
     manifest: dict[str, str] = {}
     for path in _files(benchmark.root, benchmark.include + benchmark.data):
-        manifest[path.relative_to(benchmark.root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest[path.relative_to(benchmark.root).as_posix()] = _input_identity(
+            path, path.stat().st_mode & _EXECUTABLE_BITS
+        )
     return fingerprint_manifest(manifest), manifest
+
+
+def _capture_stat(path: Path) -> tuple[int, int, int]:
+    info = path.stat()
+    return info.st_size, info.st_mtime_ns, info.st_mode & _EXECUTABLE_BITS
 
 
 def capture(benchmark: Benchmark, state_dir: Path) -> Snapshot:
     root = benchmark.root
     patterns = benchmark.include + benchmark.data
     paths = _files(root, patterns)
-    manifest: dict[str, str] = {}
-    before: dict[str, tuple[int, int]] = {}
-    for p in paths:
-        rel = p.relative_to(root).as_posix()
-        st = p.stat()
-        before[rel] = (st.st_size, st.st_mtime_ns)
-        manifest[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    before = {p.relative_to(root).as_posix(): _capture_stat(p) for p in paths}
+    manifest = {
+        p.relative_to(root).as_posix(): _input_identity(p, before[p.relative_to(root).as_posix()][2])
+        for p in paths
+    }
     digest = fingerprint_manifest(manifest)
     target = state_dir / "snapshots" / digest
-    if not target.exists():
-        temp = target.with_name(target.name + ".tmp")
-        shutil.rmtree(temp, ignore_errors=True)
-        temp.mkdir(parents=True)
-        for p in paths:
-            rel = p.relative_to(root)
-            try:
+    temp = None
+    try:
+        if not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp = Path(tempfile.mkdtemp(prefix=f".{digest}-", dir=target.parent))
+            for p in paths:
+                rel = p.relative_to(root)
                 dest = temp / rel
+                executable_bits = before[rel.as_posix()][2]
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(p, dest)
-                if hashlib.sha256(dest.read_bytes()).hexdigest() != manifest[rel.as_posix()]:
+                if executable_bits:
+                    dest.chmod((dest.stat().st_mode & 0o666) | executable_bits)
+                if _input_identity(dest, dest.stat().st_mode & _EXECUTABLE_BITS) != manifest[rel.as_posix()]:
                     raise UnsafeWorkspace(f"source changed while snapshotting: {rel}")
-            except OSError as exc:
-                shutil.rmtree(temp, ignore_errors=True)
-                raise UnsafeWorkspace(f"cannot snapshot {rel}: {exc}") from exc
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temp.replace(target)
-    after_paths = _files(root, patterns)
-    after_names = [p.relative_to(root).as_posix() for p in after_paths]
-    if after_names != sorted(manifest):
-        shutil.rmtree(target, ignore_errors=True)
-        raise UnsafeWorkspace("source scope changed while taking snapshot; retry after it settles")
-    after = {p.relative_to(root).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns) for p in after_paths}
-    if before != after:
-        shutil.rmtree(target, ignore_errors=True)
-        raise UnsafeWorkspace("source scope changed while taking snapshot; retry after it settles")
-    # Re-read all live bytes after materialization. This catches additions, removals,
-    # and same-size replacements that the initial enumeration cannot see.
-    after_manifest = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in after_paths}
-    if after_manifest != manifest:
-        shutil.rmtree(target, ignore_errors=True)
-        raise UnsafeWorkspace("source scope changed while taking snapshot; retry after it settles")
-    return Snapshot(digest, manifest, target)
 
+        after_paths = _files(root, patterns)
+        after = {p.relative_to(root).as_posix(): _capture_stat(p) for p in after_paths}
+        if before != after:
+            raise UnsafeWorkspace("source scope changed while taking snapshot; retry after it settles")
+        # Re-read the live bytes to catch same-size replacements.
+        after_manifest = {
+            p.relative_to(root).as_posix(): _input_identity(p, after[p.relative_to(root).as_posix()][2])
+            for p in after_paths
+        }
+        if after_manifest != manifest:
+            raise UnsafeWorkspace("source scope changed while taking snapshot; retry after it settles")
+
+        if temp is not None:
+            try:
+                temp.rename(target)
+            except OSError:
+                if not target.is_dir():
+                    raise
+                # A concurrent caller already published the same identity.
+        return Snapshot(digest, manifest, target)
+    except OSError as exc:
+        raise UnsafeWorkspace(f"cannot snapshot workspace: {exc}") from exc
+    finally:
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)

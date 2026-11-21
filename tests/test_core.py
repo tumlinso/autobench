@@ -600,6 +600,7 @@ kill_seconds=5
                 result = json.loads(stdout.getvalue())
                 self.assertEqual(code, 0)
                 self.assertTrue(result["initialized"])
+                self.assertEqual(result["active"], case == "allowed")
                 if case == "allowed":
                     self.assertEqual(result["readiness"], "ready")
                     self.assertTrue(result["service_activated"])
@@ -831,7 +832,7 @@ resources={cpu_cores=1}
                 staged.mkdir(parents=True, exist_ok=True)
                 (staged / "result.json").write_text(json.dumps({"status": "storage_over_cap", "returncode": 125}))
                 usage = sum(path.stat().st_size for path in autobench.rglob("*") if path.is_file())
-                self.assertLess(usage + engine._reserved_bytes(usage), 10 * 1024 * 1024)
+                self.assertLess(usage + engine._reserved_bytes(), 10 * 1024 * 1024)
 
                 self.assertEqual(asyncio.run(engine._reconcile_jobs()), 0)
                 self.assertEqual([args["action"] for operation, args in scheduler.calls if operation == "jobs.control"], ["cancel"])
@@ -880,12 +881,12 @@ resources={cpu_cores=1}
             ):
                 allocator.register_resource(resource)
             raw = {"cpu_cores": 2, "host_memory_bytes": 1024**3, "gpu_memory_bytes": 512 * 1024**2}
-            requirements, tags = _scheduler_resources(raw, [gpu_id])
+            requirements, tags = _scheduler_resources(raw)
             self.assertEqual([(item["kind"], item["quantities"]) for item in requirements], [
                 ("cpu", {"cores": 2}), ("memory", {"bytes": 1024**3}),
                 ("gpu", {"memory_bytes": 512 * 1024**2}),
             ])
-            self.assertEqual(requirements[-1]["selectors"], {"resource_id": gpu_id})
+            self.assertNotIn("selectors", requirements[-1])
             self.assertEqual(requirements[-1]["mode"], "exclusive")
             self.assertIn("gpu.exclusive", tags)
             allocation = allocator.preview_allocation([ResourceRequirement.from_dict(item) for item in requirements])
@@ -904,7 +905,7 @@ resources={cpu_cores=1}
         self.assertEqual(identity[0]["uuid"], "GPU-1")
         self.assertEqual(identity[0]["host_id"], "host")
 
-    def test_gpu_forecast_binds_uuid_and_quiescence_to_scheduler_job(self):
+    def test_gpu_forecast_ranks_work_without_binding_job_selectors(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp)
             (project / ".autobench/registry").mkdir(parents=True)
@@ -934,7 +935,7 @@ resources={cpu_cores=1}
                 asyncio.run(engine._submit(benchmark, project, project / ".autobench/builds/x", packet, 0,
                                            "fp", "timeline-profile", identity=chosen["identity"]))
                 spec = scheduler.job_spec
-                self.assertEqual(spec["resources"][0]["selectors"], {"resource_id": "gpu:worker-a:GPU-123"})
+                self.assertNotIn("selectors", spec["resources"][0])
                 self.assertEqual(spec["resources"][0]["quantities"], {"memory_bytes": 1_000_000})
                 self.assertEqual(spec["preconditions"][0]["name"], "gpu.quiescence")
                 self.assertEqual(spec["preconditions"][0]["parameters"], {
@@ -1010,6 +1011,7 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
                 config=SchedulerConfig(state_root=Path(temp) / "scheduler-state",
                                        execution_root=root, artifact_root=Path(temp) / "scheduler-artifacts"),
             )
+            core.tick()
             principal = Principal(
                 "agent:one", actions=frozenset({"jobs.submit", "jobs.read", "jobs.control", "jobs.list",
                                                  "resources.forecast", "history.compact:autobench"}),
@@ -1036,7 +1038,7 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
                 })
                 submitted = [args["spec"] for operation, args in client.calls if operation == "jobs.submit"]
                 self.assertEqual(len(submitted), 1)
-                self.assertEqual(submitted[0]["resources"][-1]["selectors"], {"resource_id": "gpu:host:GPU-test"})
+                self.assertNotIn("selectors", submitted[0]["resources"][-1])
                 self.assertEqual(submitted[0]["preconditions"][0]["name"], "gpu.quiescence")
             finally:
                 engine.close()
@@ -1464,9 +1466,17 @@ resources={cpu_cores=1,host_memory_bytes=1048576,gpu_memory_bytes=1048576}
                 chosen = asyncio.run(engine._choose_candidate([candidate]))
                 self.assertFalse(chosen["identity"]["forecast_ready"])
                 self.assertEqual(chosen["identity"]["selected_resource_ids"], [])
-                with self.assertRaisesRegex(Exception, "feasible-now forecast-selected"):
-                    asyncio.run(engine._submit(benchmark, project, project / ".autobench/builds/x", packet, 0,
-                                               "fp", "timeline-profile", identity=chosen["identity"]))
+                (project / "profile.py").touch()
+                (project / ".autobench/registry/demo.toml").write_text(
+                    '[benchmark]\nname="demo"\n[source]\ninclude=["profile.py"]\n'
+                    '[[packet]]\nname="profile"\nkind="timeline-profile"\nargv=["python3","profile.py"]\n'
+                    'expected_seconds=2\nkill_seconds=30\n[packet.resources]\ngpu_memory_bytes=1024\n'
+                )
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "idle")
+                seen = engine.store.get("seen:demo")
+                seen["since"] = time.time() - 3
+                engine.store.set("seen:demo", seen)
+                self.assertEqual(asyncio.run(engine.reconcile_once())["state"], "waiting_for_forecast_resources")
                 self.assertFalse(any(operation == "jobs.submit" for operation, _args in scheduler.calls))
             finally:
                 engine.close()

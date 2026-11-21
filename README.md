@@ -46,6 +46,35 @@ The same engine is available through `autobench.api` for initialization,
 registration, and workspace operations. `autobench serve` reconciles all enrolled
 workspaces; `pause`, `resume`, `compare`, and `explain` operate on project evidence.
 
+## Run a benchmark now
+
+From a configured workspace, run a registered benchmark, a trusted TOML recipe
+once, or one command with declared inputs.
+
+```sh
+autobench run sparse-support
+autobench run --file bench/probe.toml
+autobench run --include 'bench/**' --gpu 1 --gpu-memory-mib 1024 -- ./bench/measure
+```
+
+Raw runs use exact argv from the snapshot. Declare workspace source with
+`--include` and data with `--data`. Repeat either flag for additional inputs.
+Raw runs default to timing and request GPUs only with `--gpu` and a per-device
+memory budget. Use `--kind correctness` for a correctness check. The raw runtime
+estimate and hard limit default to 5 and 30 seconds and can be set with
+`--expected-seconds` and `--kill-seconds`.
+
+The first JSON line reports the accepted run ID. The last line contains the
+result or a blocker and its next action. A request blocked before acceptance
+prints just the blocker. The default per-packet admission deadline is 60 seconds
+and can be set with `--admission-seconds`. Use `--foreground` to request existing
+interactive priority if your Scheduler principal has that grant.
+
+To reconnect after a disconnect or a client wait limit, use
+`autobench wait RUN_ID`. Both commands accept `--wait-seconds` to limit the client
+wait while the service continues managing the run. A successful benchmark returns
+exit code zero. The asynchronous Python API exposes `start_run` and `wait_run`.
+
 ## Bounded evidence
 
 Defaults are 1 GiB retained data per workspace, a configurable 4 GiB host ceiling,
